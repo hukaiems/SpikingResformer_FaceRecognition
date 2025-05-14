@@ -1,5 +1,7 @@
 # SpikingResformer: Bridging ResNet and Vision Transformer in Spiking Neural Networks
 
+# We will use the SpikingResformer model then make it becomes Siamese network for Face Recognization
+
 ## Installing Dependencies
 
 ```bash
