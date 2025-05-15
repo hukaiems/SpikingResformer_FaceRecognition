@@ -35,6 +35,8 @@ from timm.loss import SoftTargetCrossEntropy
 from timm.optim import create_optimizer_v2
 from timm.scheduler import create_scheduler_v2
 from timm.models import create_model
+from datasets.triplet_face import TripletFaceDataset
+
 
 
 def parse_args():
@@ -74,6 +76,14 @@ def parse_args():
     parser.add_argument('--transfer', type=str, help='transfer from pretrained checkpoint')
     parser.add_argument('--input-size', type=int, nargs='+', default=[])
     parser.add_argument('--distributed-init-mode', type=str, default='env://')
+
+    # triplet load
+    parser.add_argument('--dataset', default='imagenet', type=str, help='Dataset name: imagenet or tripletface')
+    parser.add_argument('--triplet-list-train', type=str, default='',
+                        help='Path to training triplet list txt file')
+    parser.add_argument('--triplet-list-val',   type=str, default='',
+                        help='Path to validation triplet list txt file')
+
 
     # argument of TET
     parser.add_argument('--TET', action='store_true', help='Use TET training')
@@ -155,6 +165,8 @@ def load_data(
     cutout: bool,
     label_smoothing: float,
     T: int,
+    triplet_list_train: str,
+    triplet_list_val:   str,  
 ):
 
     if dataset_type == 'CIFAR10':
@@ -336,6 +348,31 @@ def load_data(
         data_loader_test = torch.utils.data.DataLoader(dataset_test, batch_size=batch_size,
                                                        sampler=test_sampler, num_workers=workers,
                                                        pin_memory=True, drop_last=False)
+    elif dataset_type.lower() == 'tripletface':
+        # common transforms
+        transform = transforms.Compose([
+            transforms.Resize(input_size[-2:]),
+            transforms.CenterCrop(input_size[-2:]),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485,0.456,0.406],
+                                std=[0.229,0.224,0.225]),
+        ])
+        # train set
+        train_ds = TripletFaceDataset(triplet_list_train, transform=transform)
+        data_loader_train = torch.utils.data.DataLoader(
+            train_ds, batch_size=batch_size,
+            shuffle=True, num_workers=workers,
+            pin_memory=True, drop_last=True,
+        )
+        # val/test set
+        val_ds = TripletFaceDataset(triplet_list_val, transform=transform)
+        data_loader_test = torch.utils.data.DataLoader(
+            val_ds, batch_size=batch_size,
+            shuffle=False, num_workers=workers,
+            pin_memory=True, drop_last=False,
+        )
+        dataset_train, dataset_test = train_ds, val_ds
+
     elif dataset_type == 'ImageNet' or dataset_type == 'ImageNet100':
         traindir = os.path.join(dataset_dir, 'train')
         valdir = os.path.join(dataset_dir, 'val')
@@ -629,7 +666,7 @@ def main():
 
     dataset_train, dataset_test, data_loader_train, data_loader_test = load_data(
         args.data_path, args.batch_size, args.workers, num_classes, dataset_type, input_size,
-        distributed, args.augment, args.mixup, args.cutout, args.label_smoothing, args.T)
+        distributed, args.augment, args.mixup, args.cutout, args.label_smoothing, args.T, args.triplet_list, args.triplet_list_train, args.triplet_list_val)
     logger.info('dataset_train: {}, dataset_test: {}'.format(len(dataset_train), len(dataset_test)))
 
     # model
@@ -818,7 +855,7 @@ def main():
     _, _, _, data_loader_test = load_data(args.data_path, args.batch_size, args.workers,
                                           num_classes, dataset_type, input_size, False,
                                           args.augment, args.mixup, args.cutout,
-                                          args.label_smoothing, args.T)
+                                          args.label_smoothing, args.T, args.triplet_list_train, args.triplet_list_val)
 
     ##### test #####
 
