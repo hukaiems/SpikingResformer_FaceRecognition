@@ -65,6 +65,11 @@ def tb_record(
     tb_writer.add_scalar('test/acc1', test_acc1, epoch)
     tb_writer.add_scalar('test/acc5', test_acc5, epoch)
 
+def tb_record_triplet(tb_writer, train_loss, test_loss, test_acc, epoch):
+    tb_writer.add_scalar('train/loss', train_loss, epoch)
+    tb_writer.add_scalar('test/loss', test_loss, epoch)
+    tb_writer.add_scalar('test/accuracy', test_acc, epoch)
+
 
 def accuracy(output: torch.Tensor, target: torch.Tensor, topk=(1, )):
     r"""
