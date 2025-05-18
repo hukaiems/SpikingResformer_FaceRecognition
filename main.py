@@ -28,7 +28,7 @@ from utils.scheduler import BaseSchedulerPerEpoch, BaseSchedulerPerIter
 from utils.utils import RecordDict, GlobalTimer, Timer
 from utils.utils import count_convNd, count_linear, count_matmul
 from utils.utils import DatasetSplitter, DatasetWarpper, CriterionWarpper, DVStransform, SOPMonitor
-from utils.utils import is_main_process, save_on_master, tb_record, accuracy, safe_makedirs
+from utils.utils import is_main_process, save_on_master, tb_record, accuracy, safe_makedirs, tb_record_triplet
 from spikingjelly.activation_based import functional, layer, base
 from timm.data import FastCollateMixup, create_loader
 from timm.loss import SoftTargetCrossEntropy
@@ -36,6 +36,7 @@ from timm.optim import create_optimizer_v2
 from timm.scheduler import create_scheduler_v2
 from timm.models import create_model
 from datasets.triplet_face import TripletFaceDataset
+from utils.tripletloss import TripletLoss
 
 
 
@@ -505,6 +506,63 @@ def train_one_epoch(
     metric_dict.sync()
     return metric_dict['loss'].ave, metric_dict['acc@1'].ave, metric_dict['acc@5'].ave
 
+def train_one_epoch_triplet(
+    model: nn.Module,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    data_loader_train: torch.utils.data.DataLoader,
+    logger: logging.Logger,
+    print_freq: int,
+    factor: int,
+    scheduler_per_iter: Optional[BaseSchedulerPerIter] = None,
+    scaler: Optional[GradScaler] = None,
+):
+    model.train()
+    metric_dict = RecordDict({'loss': None})
+    timer_container = [0.0]
+
+    model.zero_grad()
+    for idx, (images, _) in enumerate(data_loader_train):
+        with GlobalTimer('iter', timer_container):
+            # Images already contains triplets (anchor, positive, negative)
+            # Each is [B, C, H, W] where B is actually B*3 for triplets
+            images = images.cuda()
+            
+            if scaler is not None:
+                with autocast():
+                    embeddings = model(images)
+                    loss = criterion(embeddings)
+            else:
+                embeddings = model(images)
+                loss = criterion(embeddings)
+            
+            metric_dict['loss'].update(loss.item())
+
+            if scaler is not None:
+                scaler.scale(loss).backward()  # type:ignore
+                scaler.step(optimizer)
+                scaler.update()
+                model.zero_grad()
+            else:
+                loss.backward()
+                optimizer.step()
+                model.zero_grad()
+
+            if scheduler_per_iter is not None:
+                scheduler_per_iter.step()
+
+            functional.reset_net(model)
+
+            batch_size = images.shape[0]
+
+        if print_freq != 0 and ((idx + 1) % int(len(data_loader_train) / (print_freq))) == 0:
+            metric_dict.sync()
+            logger.debug(' [{}/{}] it/s: {:.5f}, loss: {:.5f}'.format(
+                idx + 1, len(data_loader_train),
+                (idx + 1) * batch_size * factor / timer_container[0], metric_dict['loss'].ave))
+
+    metric_dict.sync()
+    return metric_dict['loss'].ave
 
 def evaluate(model, criterion, data_loader, print_freq, logger, one_hot=None):
     model.eval()
@@ -539,6 +597,45 @@ def evaluate(model, criterion, data_loader, print_freq, logger, one_hot=None):
     metric_dict.sync()
     return metric_dict['loss'].ave, metric_dict['acc@1'].ave, metric_dict['acc@5'].ave
 
+def evaluate_triplet(model, data_loader, print_freq, logger):
+    model.eval()
+    metric_dict = RecordDict({'loss': None, 'accuracy': None})
+    with torch.no_grad():
+        for idx, (images, _) in enumerate(data_loader):
+            images = images.cuda()
+            
+            embeddings = model(images)
+            
+            # Reshape to separate triplet components
+            T, batch_size, embed_dim = embeddings.shape
+            embeddings = embeddings.reshape(T, batch_size//3, 3, embed_dim)
+            
+            # Extract anchor, positive, and negative
+            anchor = embeddings[:, :, 0]  # [T, B/3, embed_dim]
+            positive = embeddings[:, :, 1]  # [T, B/3, embed_dim]
+            negative = embeddings[:, :, 2]  # [T, B/3, embed_dim]
+            
+            # Calculate distances
+            pos_dist = torch.sum((anchor - positive) ** 2, dim=-1)  # [T, B/3]
+            neg_dist = torch.sum((anchor - negative) ** 2, dim=-1)  # [T, B/3]
+            
+            # Loss calculation
+            loss = torch.clamp(pos_dist - neg_dist + 0.2, min=0).mean()
+            metric_dict['loss'].update(loss.item())
+            
+            # Accuracy: Is positive closer to anchor than negative?
+            correct = (pos_dist < neg_dist).float().mean()
+            metric_dict['accuracy'].update(correct.item(), batch_size//3)
+            
+            functional.reset_net(model)
+
+            if print_freq != 0 and ((idx + 1) % int(len(data_loader) / print_freq)) == 0:
+                metric_dict.sync()
+                logger.debug(' [{}/{}] loss: {:.5f}, accuracy: {:.5f}'.format(
+                    idx + 1, len(data_loader), metric_dict['loss'].ave, metric_dict['accuracy'].ave))
+
+    metric_dict.sync()
+    return metric_dict['loss'].ave, metric_dict['accuracy'].ave
 
 def test(
     model: nn.Module,
@@ -666,7 +763,7 @@ def main():
 
     dataset_train, dataset_test, data_loader_train, data_loader_test = load_data(
         args.data_path, args.batch_size, args.workers, num_classes, dataset_type, input_size,
-        distributed, args.augment, args.mixup, args.cutout, args.label_smoothing, args.T, args.triplet_list, args.triplet_list_train, args.triplet_list_val)
+        distributed, args.augment, args.mixup, args.cutout, args.label_smoothing, args.T, args.triplet_list_train, args.triplet_list_val)
     logger.info('dataset_train: {}, dataset_test: {}'.format(len(dataset_train), len(dataset_test)))
 
     # model
@@ -694,13 +791,13 @@ def main():
 
     # loss_fn
 
-    if args.mixup:
-        criterion = SoftTargetCrossEntropy()
-    else:
-        criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
-    criterion = CriterionWarpper(criterion, args.TET, args.TET_phi, args.TET_lambda)
-    criterion_eval = nn.CrossEntropyLoss()
-    criterion_eval = CriterionWarpper(criterion_eval)
+    margin = 0.2  # You can make this configurable through args
+    criterion = TripletLoss(margin=margin)
+    criterion_eval = TripletLoss(margin=margin)  # Same loss for evaluation
+
+    if args.TET:
+        criterion = CriterionWarpper(criterion, args.TET, args.TET_phi, args.TET_lambda)
+        criterion_eval = CriterionWarpper(criterion_eval)
 
     # amp speed up
 
@@ -784,26 +881,25 @@ def main():
         logger.info('Epoch [{}] Start, lr {:.6f}'.format(epoch, optimizer.param_groups[0]["lr"]))
 
         with Timer(' Train', logger):
-            train_loss, train_acc1, train_acc5 = train_one_epoch(model, criterion, optimizer,
+            train_loss = train_one_epoch_triplet(model, criterion, optimizer,
                                                                  data_loader_train, logger,
                                                                  args.print_freq, world_size,
-                                                                 scheduler_per_iter, scaler,
-                                                                 one_hot)
+                                                                 scheduler_per_iter, scaler)
             if lr_scheduler is not None:
                 lr_scheduler.step(epoch + 1)
             if scheduler_per_epoch is not None:
                 scheduler_per_epoch.step()
 
         with Timer(' Test', logger):
-            test_loss, test_acc1, test_acc5 = evaluate(model, criterion_eval, data_loader_test,
-                                                       args.print_freq, logger, one_hot)
+            test_loss, test_acc = evaluate_triplet(model, data_loader_test,  # Notice no criterion here
+                                          args.print_freq, logger)
+            # Only returns loss and accuracy, not test_acc5
 
         if is_main_process() and tb_writer is not None:
-            tb_record(tb_writer, train_loss, train_acc1, train_acc5, test_loss, test_acc1,
-                      test_acc5, epoch)
+            tb_record_triplet(tb_writer, train_loss, test_loss, test_acc,
+                      epoch)
 
-        logger.info(' Test loss: {:.5f}, Acc@1: {:.5f}, Acc@5: {:.5f}'.format(
-            test_loss, test_acc1, test_acc5))
+        logger.info(' Test loss: {:.5f}, Accuracy: {:.5f}'.format(test_loss, test_acc))
 
         checkpoint = {
             'model': model_without_ddp.state_dict(),
@@ -816,10 +912,6 @@ def main():
 
         if args.save_latest:
             save_on_master(checkpoint, os.path.join(args.output_dir, 'checkpoint_latest.pth'))
-
-        if max_acc1 < test_acc1:
-            max_acc1 = test_acc1
-            save_on_master(checkpoint, os.path.join(args.output_dir, 'checkpoint_max_acc1.pth'))
 
     logger.info('Training completed.')
 
@@ -836,7 +928,7 @@ def main():
     model = create_model(
         args.model,
         T=args.T,
-        num_classes=num_classes,
+        num_classes=512,
         img_size=input_size[-1],
     )
 
