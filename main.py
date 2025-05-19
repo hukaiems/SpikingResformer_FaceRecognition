@@ -350,6 +350,9 @@ def load_data(
                                                        sampler=test_sampler, num_workers=workers,
                                                        pin_memory=True, drop_last=False)
     elif dataset_type.lower() == 'tripletface':
+        num_classes = 512  # For embedding size
+        input_size = (3, 224, 224)  # Standard face image size
+
         # common transforms
         transform = transforms.Compose([
             transforms.Resize(input_size[-2:]),
