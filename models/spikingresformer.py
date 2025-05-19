@@ -228,19 +228,14 @@ class SpikingResformerTriplet(SpikingResformer):
         activation=LIF,
         **kwargs,
     ):
-        # Initialize with num_classes=embedding_dim to get right size for final layer
+        # Prevent passing through any other num_classes
+        kwargs.pop('num_classes', None)
+        # Initialize with num_classes=embedding_dim for the embedding projector
         super().__init__(
-            layers=layers,
-            planes=planes,
-            num_heads=num_heads,
-            patch_sizes=patch_sizes,
-            img_size=img_size,
-            T=T,
-            in_channels=in_channels,
-            num_classes=embedding_dim,  # This becomes embedding_dim
-            prologue=prologue,
-            group_size=group_size,
-            activation=activation,
+            layers=layers, planes=planes, num_heads=num_heads, patch_sizes=patch_sizes,
+            img_size=img_size, T=T, in_channels=in_channels,
+            num_classes=embedding_dim,  # final Linear will output embedding_dim
+            prologue=prologue, group_size=group_size, activation=activation,
             **kwargs,
         )
         
