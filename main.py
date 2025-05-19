@@ -987,11 +987,38 @@ def main():
         if lr_scheduler is not None:
             checkpoint['lr_scheduler'] = lr_scheduler.state_dict()
         # custom scheduler
+        
+         # --- save “best” checkpoint ---
+        if test_acc > max_acc1:
+            max_acc1 = test_acc
+            best_ckpt = {
+                'model': model_without_ddp.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'epoch': epoch,
+                'max_acc1': max_acc1,
+            }
+            if lr_scheduler is not None:
+                best_ckpt['lr_scheduler'] = lr_scheduler.state_dict()
+            save_on_master(
+                best_ckpt,
+                os.path.join(args.output_dir, 'checkpoint_max_acc1.pth')
+            )
 
+        # optional: also save the latest
         if args.save_latest:
-            save_on_master(checkpoint, os.path.join(args.output_dir, 'checkpoint_latest.pth'))
-
-    logger.info('Training completed.')
+            latest_ckpt = {
+                'model': model_without_ddp.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'epoch': epoch,
+                'max_acc1': max_acc1,
+            }
+            if lr_scheduler is not None:
+                latest_ckpt['lr_scheduler'] = lr_scheduler.state_dict()
+            save_on_master(
+                latest_ckpt,
+                os.path.join(args.output_dir, 'checkpoint_latest.pth')
+            )
+            logger.info('Training completed.')
 
     ##################################################
     #                   test
