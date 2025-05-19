@@ -8,6 +8,7 @@ from torch import nn
 import torch.utils.data
 import torch.nn.functional as F
 import numpy as np
+np.int = int   # ← add this
 from typing import Optional, Tuple
 
 import torchvision

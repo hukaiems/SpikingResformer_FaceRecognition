@@ -1,6 +1,8 @@
 import math
 import torch
 import torch.nn as nn
+import numpy as np
+np.int = int   # ← add this
 from .submodules.layers import Conv3x3, Conv1x1, LIF, PLIF, BN, Linear, SpikingMatmul
 from spikingjelly.activation_based import layer
 from typing import Any, List, Mapping
