@@ -609,41 +609,55 @@ def evaluate_triplet(model, data_loader, print_freq, logger):
     model.eval()
     metric_dict = RecordDict({'loss': None, 'accuracy': None})
     with torch.no_grad():
-        for idx, (images, _) in enumerate(data_loader):
-            images = images.cuda()
-            
+        for idx, (anchor, positive, negative) in enumerate(data_loader):
+            # Move to GPU
+            anchor   = anchor.cuda()
+            positive = positive.cuda()
+            negative = negative.cuda()
+
+            # Concatenate into a single batch: [3*B, C, H, W]
+            images = torch.cat([anchor, positive, negative], dim=0)
+
+            # Forward pass: embeddings shape [T, 3*B, embed_dim]
             embeddings = model(images)
-            
-            # Reshape to separate triplet components
-            T, batch_size, embed_dim = embeddings.shape
-            embeddings = embeddings.reshape(T, batch_size//3, 3, embed_dim)
-            
-            # Extract anchor, positive, and negative
-            anchor = embeddings[:, :, 0]  # [T, B/3, embed_dim]
-            positive = embeddings[:, :, 1]  # [T, B/3, embed_dim]
-            negative = embeddings[:, :, 2]  # [T, B/3, embed_dim]
-            
-            # Calculate distances
-            pos_dist = torch.sum((anchor - positive) ** 2, dim=-1)  # [T, B/3]
-            neg_dist = torch.sum((anchor - negative) ** 2, dim=-1)  # [T, B/3]
-            
-            # Loss calculation
+
+            # Reshape to [T, B, 3, embed_dim]
+            T, total, embed_dim = embeddings.shape
+            B = total // 3
+            embeddings = embeddings.reshape(T, B, 3, embed_dim)
+
+            # Split out the triplet views
+            anchor_e   = embeddings[:, :, 0]  # [T, B, embed_dim]
+            positive_e = embeddings[:, :, 1]
+            negative_e = embeddings[:, :, 2]
+
+            # Compute squared distances [T, B]
+            pos_dist = torch.sum((anchor_e - positive_e) ** 2, dim=-1)
+            neg_dist = torch.sum((anchor_e - negative_e) ** 2, dim=-1)
+
+            # Triplet loss: margin=0.2
             loss = torch.clamp(pos_dist - neg_dist + 0.2, min=0).mean()
             metric_dict['loss'].update(loss.item())
-            
-            # Accuracy: Is positive closer to anchor than negative?
+
+            # Accuracy: fraction of (pos_dist < neg_dist)
             correct = (pos_dist < neg_dist).float().mean()
-            metric_dict['accuracy'].update(correct.item(), batch_size//3)
-            
+            metric_dict['accuracy'].update(correct.item(), B)
+
+            # reset spiking states
             functional.reset_net(model)
 
-            if print_freq != 0 and ((idx + 1) % int(len(data_loader) / print_freq)) == 0:
+            # Logging
+            if print_freq and ((idx + 1) % int(len(data_loader) / print_freq) == 0):
                 metric_dict.sync()
-                logger.debug(' [{}/{}] loss: {:.5f}, accuracy: {:.5f}'.format(
-                    idx + 1, len(data_loader), metric_dict['loss'].ave, metric_dict['accuracy'].ave))
+                logger.debug(
+                    f' [{idx+1}/{len(data_loader)}] '
+                    f'loss: {metric_dict["loss"].ave:.5f}, '
+                    f'accuracy: {metric_dict["accuracy"].ave:.5f}'
+                )
 
     metric_dict.sync()
     return metric_dict['loss'].ave, metric_dict['accuracy'].ave
+
 
 def test(
     model: nn.Module,
