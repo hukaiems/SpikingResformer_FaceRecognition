@@ -1057,7 +1057,7 @@ def main():
     ##### test #####
 
     if is_main_process():
-        test_triplet(model, data_loader_test, input_size, args, logger)
+        test_triplet(model.cuda(), data_loader_test, args.print_freq, logger)
     logger.info('All Done.')
 
 
