@@ -123,62 +123,6 @@ class DownsampleLayer(nn.Module):
         x = self.norm(x)
         return x
 
-class SpikingResformerTriplet():
-    def __init__(
-        self,
-        layers: List[List[str]],
-        planes: List[int],
-        num_heads: List[int],
-        patch_sizes: List[int],
-        img_size=224,
-        T=4,
-        in_channels=3,
-        embedding_dim=512,  # Embedding dimension
-        prologue=None,
-        group_size=64,
-        activation=LIF,
-        **kwargs,
-    ):
-        # Initialize with num_classes=embedding_dim to get right size for final layer
-        super().__init__(
-            layers=layers,
-            planes=planes,
-            num_heads=num_heads,
-            patch_sizes=patch_sizes,
-            img_size=img_size,
-            T=T,
-            in_channels=in_channels,
-            num_classes=embedding_dim,  # This becomes embedding_dim
-            prologue=prologue,
-            group_size=group_size,
-            activation=activation,
-            **kwargs,
-        )
-        
-        # Replace classifier with embedding projector
-        self.classifier = Linear(planes[-1], embedding_dim)
-        
-        # Add L2 normalization for embedding
-        self.l2_norm = lambda x: nn.functional.normalize(x, p=2, dim=-1)
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() != 5:
-            x = x.unsqueeze(0).repeat(self.T, 1, 1, 1, 1)
-            assert x.dim() == 5
-        else:
-            #### [B, T, C, H, W] -> [T, B, C, H, W]
-            x = x.transpose(0, 1)
-        x = self.prologue(x)
-        x = self.layers(x)
-        x = self.avgpool(x)
-        x = torch.flatten(x, 2)
-        x = self.classifier(x)
-        
-        # Normalize embedding
-        x = self.l2_norm(x)
-        return x
-
-
 class SpikingResformer(nn.Module):
     def __init__(
         self,
@@ -267,6 +211,61 @@ class SpikingResformer(nn.Module):
             if isinstance(module, PLIF):
                 ret.add(name + '.w')
         return ret
+
+class SpikingResformerTriplet(SpikingResformer):
+    def __init__(
+        self,
+        layers: List[List[str]],
+        planes: List[int],
+        num_heads: List[int],
+        patch_sizes: List[int],
+        img_size=224,
+        T=4,
+        in_channels=3,
+        embedding_dim=512,  # Embedding dimension
+        prologue=None,
+        group_size=64,
+        activation=LIF,
+        **kwargs,
+    ):
+        # Initialize with num_classes=embedding_dim to get right size for final layer
+        super().__init__(
+            layers=layers,
+            planes=planes,
+            num_heads=num_heads,
+            patch_sizes=patch_sizes,
+            img_size=img_size,
+            T=T,
+            in_channels=in_channels,
+            num_classes=embedding_dim,  # This becomes embedding_dim
+            prologue=prologue,
+            group_size=group_size,
+            activation=activation,
+            **kwargs,
+        )
+        
+        # Replace classifier with embedding projector
+        self.classifier = Linear(planes[-1], embedding_dim)
+        
+        # Add L2 normalization for embedding
+        self.l2_norm = lambda x: nn.functional.normalize(x, p=2, dim=-1)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 5:
+            x = x.unsqueeze(0).repeat(self.T, 1, 1, 1, 1)
+            assert x.dim() == 5
+        else:
+            #### [B, T, C, H, W] -> [T, B, C, H, W]
+            x = x.transpose(0, 1)
+        x = self.prologue(x)
+        x = self.layers(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 2)
+        x = self.classifier(x)
+        
+        # Normalize embedding
+        x = self.l2_norm(x)
+        return x
 
 @register_model
 def spikingresformer_triplet_ti(**kwargs):
