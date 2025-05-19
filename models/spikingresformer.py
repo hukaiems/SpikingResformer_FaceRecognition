@@ -123,7 +123,7 @@ class DownsampleLayer(nn.Module):
         x = self.norm(x)
         return x
 
-class SpikingResformerTriplet(SpikingResformer):
+class SpikingResformerTriplet():
     def __init__(
         self,
         layers: List[List[str]],
