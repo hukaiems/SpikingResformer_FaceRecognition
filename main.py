@@ -3,6 +3,8 @@ import time
 import yaml
 import random
 import logging
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 from torch import nn
 import torch.utils.data
