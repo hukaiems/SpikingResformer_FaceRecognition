@@ -1057,7 +1057,7 @@ def main():
     ##### test #####
 
     if is_main_process():
-        test(model, data_loader_test, input_size, args, logger)
+        test_triplet(model, data_loader_test, input_size, args, logger)
     logger.info('All Done.')
 
 
