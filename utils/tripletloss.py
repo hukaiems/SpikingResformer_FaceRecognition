@@ -1,3 +1,6 @@
+import torch
+from torch import nn
+
 class TripletLoss(nn.Module):
     def __init__(self, margin=0.2):
         super(TripletLoss, self).__init__()
