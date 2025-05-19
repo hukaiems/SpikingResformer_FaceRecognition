@@ -507,27 +507,27 @@ def train_one_epoch(
     return metric_dict['loss'].ave, metric_dict['acc@1'].ave, metric_dict['acc@5'].ave
 
 def train_one_epoch_triplet(
-    model: nn.Module,
-    criterion: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    data_loader_train: torch.utils.data.DataLoader,
-    logger: logging.Logger,
-    print_freq: int,
-    factor: int,
-    scheduler_per_iter: Optional[BaseSchedulerPerIter] = None,
-    scaler: Optional[GradScaler] = None,
+    model, criterion, optimizer,
+    data_loader_train, logger,
+    print_freq, factor,
+    scheduler_per_iter=None, scaler=None,
 ):
     model.train()
     metric_dict = RecordDict({'loss': None})
     timer_container = [0.0]
-
     model.zero_grad()
-    for idx, (images, _) in enumerate(data_loader_train):
+
+    for idx, (anchor, positive, negative) in enumerate(data_loader_train):
         with GlobalTimer('iter', timer_container):
-            # Images already contains triplets (anchor, positive, negative)
-            # Each is [B, C, H, W] where B is actually B*3 for triplets
-            images = images.cuda()
-            
+            # Move each tensor to GPU
+            anchor   = anchor.cuda()
+            positive = positive.cuda()
+            negative = negative.cuda()
+
+            # Concatenate into one big batch: [3*B, C, H, W]
+            images = torch.cat([anchor, positive, negative], dim=0)
+
+            # Forward + loss
             if scaler is not None:
                 with autocast():
                     embeddings = model(images)
@@ -535,11 +535,12 @@ def train_one_epoch_triplet(
             else:
                 embeddings = model(images)
                 loss = criterion(embeddings)
-            
+
             metric_dict['loss'].update(loss.item())
 
+            # Backward + step
             if scaler is not None:
-                scaler.scale(loss).backward()  # type:ignore
+                scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
                 model.zero_grad()
@@ -548,21 +549,25 @@ def train_one_epoch_triplet(
                 optimizer.step()
                 model.zero_grad()
 
+            # Iter‐level scheduler
             if scheduler_per_iter is not None:
                 scheduler_per_iter.step()
 
             functional.reset_net(model)
 
-            batch_size = images.shape[0]
-
-        if print_freq != 0 and ((idx + 1) % int(len(data_loader_train) / (print_freq))) == 0:
+        # Logging
+        batch_size = anchor.size(0)
+        if print_freq and ((idx + 1) % int(len(data_loader_train) / print_freq) == 0):
             metric_dict.sync()
-            logger.debug(' [{}/{}] it/s: {:.5f}, loss: {:.5f}'.format(
-                idx + 1, len(data_loader_train),
-                (idx + 1) * batch_size * factor / timer_container[0], metric_dict['loss'].ave))
+            logger.debug(
+                f' [{idx+1}/{len(data_loader_train)}] it/s: '
+                f'{(idx+1)*batch_size*factor/timer_container[0]:.5f}, '
+                f'loss: {metric_dict["loss"].ave:.5f}'
+            )
 
     metric_dict.sync()
     return metric_dict['loss'].ave
+
 
 def evaluate(model, criterion, data_loader, print_freq, logger, one_hot=None):
     model.eval()
