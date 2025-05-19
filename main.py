@@ -731,6 +731,59 @@ def test(
     logger.info('Avg SOPs: {:.5f} G, Power: {:.5f} mJ.'.format(sops, 0.9 * sops))
     logger.info('A/S Power Ratio: {:.6f}'.format((4.6 * ops) / (0.9 * sops)))
 
+def test_triplet(
+    model: nn.Module,
+    data_loader_test: torch.utils.data.DataLoader,
+    print_freq: int,
+    logger: logging.Logger,
+    margin: float = 0.2,
+):
+    model.eval()
+    metric_dict = RecordDict({'loss': None, 'accuracy': None})
+    with torch.no_grad():
+        for idx, (anchor, positive, negative) in enumerate(data_loader_test):
+            # Move all to GPU
+            anchor   = anchor.cuda()
+            positive = positive.cuda()
+            negative = negative.cuda()
+
+            # Build a single batch
+            images = torch.cat([anchor, positive, negative], dim=0)
+            embeddings = model(images)  # [T, 3*B, D]
+
+            # Reshape to separate triplets
+            T, total, D = embeddings.shape
+            B = total // 3
+            embeddings = embeddings.view(T, B, 3, D)
+            a_e = embeddings[:, :, 0]
+            p_e = embeddings[:, :, 1]
+            n_e = embeddings[:, :, 2]
+
+            # Compute distances
+            pos_dist = torch.sum((a_e - p_e) ** 2, dim=-1)  # [T, B]
+            neg_dist = torch.sum((a_e - n_e) ** 2, dim=-1)  # [T, B]
+
+            # Triplet loss + accuracy
+            loss = torch.clamp(pos_dist - neg_dist + margin, min=0).mean()
+            correct = (pos_dist < neg_dist).float().mean()
+
+            metric_dict['loss'].update(loss.item())
+            metric_dict['accuracy'].update(correct.item(), B)
+
+            functional.reset_net(model)
+
+            # Logging
+            if print_freq and ((idx + 1) % int(len(data_loader_test) / print_freq) == 0):
+                metric_dict.sync()
+                logger.debug(
+                    f' [{idx+1}/{len(data_loader_test)}] '
+                    f'loss: {metric_dict["loss"].ave:.5f}, '
+                    f'accuracy: {metric_dict["accuracy"].ave:.5f}'
+                )
+
+    metric_dict.sync()
+    return metric_dict['loss'].ave, metric_dict['accuracy'].ave
+
 
 def main():
 
@@ -887,7 +940,7 @@ def main():
         if distributed:
             logger.error('Using distribute mode in test, abort')
             return
-        test(model_without_ddp, data_loader_test, input_size, args, logger)
+        test_triplet(model_without_ddp, data_loader_test, args.print_freq, logger)
         return
 
     ##################################################
@@ -916,8 +969,8 @@ def main():
                 scheduler_per_epoch.step()
 
         with Timer(' Test', logger):
-            test_loss, test_acc = evaluate_triplet(model, data_loader_test,  # Notice no criterion here
-                                          args.print_freq, logger)
+            test_loss, test_acc = test_triplet(model, data_loader_test, args.print_freq, logger)
+
             # Only returns loss and accuracy, not test_acc5
 
         if is_main_process() and tb_writer is not None:
