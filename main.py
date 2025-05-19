@@ -35,7 +35,7 @@ from timm.loss import SoftTargetCrossEntropy
 from timm.optim import create_optimizer_v2
 from timm.scheduler import create_scheduler_v2
 from timm.models import create_model
-from datasets.triplet_face import TripletFaceDataset
+from utils.triplet_face import TripletFaceDataset
 from utils.tripletloss import TripletLoss
 
 
