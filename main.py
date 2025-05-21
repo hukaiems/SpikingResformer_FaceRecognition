@@ -3,11 +3,14 @@ import time
 import yaml
 import random
 import logging
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 from torch import nn
 import torch.utils.data
 import torch.nn.functional as F
 import numpy as np
+np.int = int   # ← add this
 from typing import Optional, Tuple
 
 import torchvision
@@ -35,7 +38,7 @@ from timm.loss import SoftTargetCrossEntropy
 from timm.optim import create_optimizer_v2
 from timm.scheduler import create_scheduler_v2
 from timm.models import create_model
-from datasets.triplet_face import TripletFaceDataset
+from utils.triplet_face import TripletFaceDataset
 from utils.tripletloss import TripletLoss
 
 
@@ -59,7 +62,7 @@ def parse_args():
     parser.add_argument('--batch-size', default=32, type=int)
     parser.add_argument('--T', default=4, type=int, help='simulation steps')
     parser.add_argument('--model', default='spikingresformer_ti', help='model type')
-    parser.add_argument('--dataset', default='ImageNet', help='dataset type')
+    # parser.add_argument('--dataset', default='ImageNet', help='dataset type')
     parser.add_argument('--augment', type=str, help='data augmentation')
     parser.add_argument('--mixup', type=bool, default=False, help='Mixup')
     parser.add_argument('--cutout', type=bool, default=False, help='Cutout')
@@ -507,27 +510,27 @@ def train_one_epoch(
     return metric_dict['loss'].ave, metric_dict['acc@1'].ave, metric_dict['acc@5'].ave
 
 def train_one_epoch_triplet(
-    model: nn.Module,
-    criterion: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    data_loader_train: torch.utils.data.DataLoader,
-    logger: logging.Logger,
-    print_freq: int,
-    factor: int,
-    scheduler_per_iter: Optional[BaseSchedulerPerIter] = None,
-    scaler: Optional[GradScaler] = None,
+    model, criterion, optimizer,
+    data_loader_train, logger,
+    print_freq, factor,
+    scheduler_per_iter=None, scaler=None,
 ):
     model.train()
     metric_dict = RecordDict({'loss': None})
     timer_container = [0.0]
-
     model.zero_grad()
-    for idx, (images, _) in enumerate(data_loader_train):
+
+    for idx, (anchor, positive, negative) in enumerate(data_loader_train):
         with GlobalTimer('iter', timer_container):
-            # Images already contains triplets (anchor, positive, negative)
-            # Each is [B, C, H, W] where B is actually B*3 for triplets
-            images = images.cuda()
-            
+            # Move each tensor to GPU
+            anchor   = anchor.cuda()
+            positive = positive.cuda()
+            negative = negative.cuda()
+
+            # Concatenate into one big batch: [3*B, C, H, W]
+            images = torch.cat([anchor, positive, negative], dim=0)
+
+            # Forward + loss
             if scaler is not None:
                 with autocast():
                     embeddings = model(images)
@@ -535,11 +538,12 @@ def train_one_epoch_triplet(
             else:
                 embeddings = model(images)
                 loss = criterion(embeddings)
-            
+
             metric_dict['loss'].update(loss.item())
 
+            # Backward + step
             if scaler is not None:
-                scaler.scale(loss).backward()  # type:ignore
+                scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
                 model.zero_grad()
@@ -548,21 +552,25 @@ def train_one_epoch_triplet(
                 optimizer.step()
                 model.zero_grad()
 
+            # Iter‐level scheduler
             if scheduler_per_iter is not None:
                 scheduler_per_iter.step()
 
             functional.reset_net(model)
 
-            batch_size = images.shape[0]
-
-        if print_freq != 0 and ((idx + 1) % int(len(data_loader_train) / (print_freq))) == 0:
+        # Logging
+        batch_size = anchor.size(0)
+        if print_freq and ((idx + 1) % int(len(data_loader_train) / print_freq) == 0):
             metric_dict.sync()
-            logger.debug(' [{}/{}] it/s: {:.5f}, loss: {:.5f}'.format(
-                idx + 1, len(data_loader_train),
-                (idx + 1) * batch_size * factor / timer_container[0], metric_dict['loss'].ave))
+            logger.debug(
+                f' [{idx+1}/{len(data_loader_train)}] it/s: '
+                f'{(idx+1)*batch_size*factor/timer_container[0]:.5f}, '
+                f'loss: {metric_dict["loss"].ave:.5f}'
+            )
 
     metric_dict.sync()
     return metric_dict['loss'].ave
+
 
 def evaluate(model, criterion, data_loader, print_freq, logger, one_hot=None):
     model.eval()
@@ -601,41 +609,55 @@ def evaluate_triplet(model, data_loader, print_freq, logger):
     model.eval()
     metric_dict = RecordDict({'loss': None, 'accuracy': None})
     with torch.no_grad():
-        for idx, (images, _) in enumerate(data_loader):
-            images = images.cuda()
-            
+        for idx, (anchor, positive, negative) in enumerate(data_loader):
+            # Move to GPU
+            anchor   = anchor.cuda()
+            positive = positive.cuda()
+            negative = negative.cuda()
+
+            # Concatenate into a single batch: [3*B, C, H, W]
+            images = torch.cat([anchor, positive, negative], dim=0)
+
+            # Forward pass: embeddings shape [T, 3*B, embed_dim]
             embeddings = model(images)
-            
-            # Reshape to separate triplet components
-            T, batch_size, embed_dim = embeddings.shape
-            embeddings = embeddings.reshape(T, batch_size//3, 3, embed_dim)
-            
-            # Extract anchor, positive, and negative
-            anchor = embeddings[:, :, 0]  # [T, B/3, embed_dim]
-            positive = embeddings[:, :, 1]  # [T, B/3, embed_dim]
-            negative = embeddings[:, :, 2]  # [T, B/3, embed_dim]
-            
-            # Calculate distances
-            pos_dist = torch.sum((anchor - positive) ** 2, dim=-1)  # [T, B/3]
-            neg_dist = torch.sum((anchor - negative) ** 2, dim=-1)  # [T, B/3]
-            
-            # Loss calculation
+
+            # Reshape to [T, B, 3, embed_dim]
+            T, total, embed_dim = embeddings.shape
+            B = total // 3
+            embeddings = embeddings.reshape(T, B, 3, embed_dim)
+
+            # Split out the triplet views
+            anchor_e   = embeddings[:, :, 0]  # [T, B, embed_dim]
+            positive_e = embeddings[:, :, 1]
+            negative_e = embeddings[:, :, 2]
+
+            # Compute squared distances [T, B]
+            pos_dist = torch.sum((anchor_e - positive_e) ** 2, dim=-1)
+            neg_dist = torch.sum((anchor_e - negative_e) ** 2, dim=-1)
+
+            # Triplet loss: margin=0.2
             loss = torch.clamp(pos_dist - neg_dist + 0.2, min=0).mean()
             metric_dict['loss'].update(loss.item())
-            
-            # Accuracy: Is positive closer to anchor than negative?
+
+            # Accuracy: fraction of (pos_dist < neg_dist)
             correct = (pos_dist < neg_dist).float().mean()
-            metric_dict['accuracy'].update(correct.item(), batch_size//3)
-            
+            metric_dict['accuracy'].update(correct.item(), B)
+
+            # reset spiking states
             functional.reset_net(model)
 
-            if print_freq != 0 and ((idx + 1) % int(len(data_loader) / print_freq)) == 0:
+            # Logging
+            if print_freq and ((idx + 1) % int(len(data_loader) / print_freq) == 0):
                 metric_dict.sync()
-                logger.debug(' [{}/{}] loss: {:.5f}, accuracy: {:.5f}'.format(
-                    idx + 1, len(data_loader), metric_dict['loss'].ave, metric_dict['accuracy'].ave))
+                logger.debug(
+                    f' [{idx+1}/{len(data_loader)}] '
+                    f'loss: {metric_dict["loss"].ave:.5f}, '
+                    f'accuracy: {metric_dict["accuracy"].ave:.5f}'
+                )
 
     metric_dict.sync()
     return metric_dict['loss'].ave, metric_dict['accuracy'].ave
+
 
 def test(
     model: nn.Module,
@@ -709,6 +731,59 @@ def test(
     logger.info('Avg SOPs: {:.5f} G, Power: {:.5f} mJ.'.format(sops, 0.9 * sops))
     logger.info('A/S Power Ratio: {:.6f}'.format((4.6 * ops) / (0.9 * sops)))
 
+def test_triplet(
+    model: nn.Module,
+    data_loader_test: torch.utils.data.DataLoader,
+    print_freq: int,
+    logger: logging.Logger,
+    margin: float = 0.2,
+):
+    model.eval()
+    metric_dict = RecordDict({'loss': None, 'accuracy': None})
+    with torch.no_grad():
+        for idx, (anchor, positive, negative) in enumerate(data_loader_test):
+            # Move all to GPU
+            anchor   = anchor.cuda()
+            positive = positive.cuda()
+            negative = negative.cuda()
+
+            # Build a single batch
+            images = torch.cat([anchor, positive, negative], dim=0)
+            embeddings = model(images)  # [T, 3*B, D]
+
+            # Reshape to separate triplets
+            T, total, D = embeddings.shape
+            B = total // 3
+            embeddings = embeddings.view(T, B, 3, D)
+            a_e = embeddings[:, :, 0]
+            p_e = embeddings[:, :, 1]
+            n_e = embeddings[:, :, 2]
+
+            # Compute distances
+            pos_dist = torch.sum((a_e - p_e) ** 2, dim=-1)  # [T, B]
+            neg_dist = torch.sum((a_e - n_e) ** 2, dim=-1)  # [T, B]
+
+            # Triplet loss + accuracy
+            loss = torch.clamp(pos_dist - neg_dist + margin, min=0).mean()
+            correct = (pos_dist < neg_dist).float().mean()
+
+            metric_dict['loss'].update(loss.item())
+            metric_dict['accuracy'].update(correct.item(), B)
+
+            functional.reset_net(model)
+
+            # Logging
+            if print_freq and ((idx + 1) % int(len(data_loader_test) / print_freq) == 0):
+                metric_dict.sync()
+                logger.debug(
+                    f' [{idx+1}/{len(data_loader_test)}] '
+                    f'loss: {metric_dict["loss"].ave:.5f}, '
+                    f'accuracy: {metric_dict["accuracy"].ave:.5f}'
+                )
+
+    metric_dict.sync()
+    return metric_dict['loss'].ave, metric_dict['accuracy'].ave
+
 
 def main():
 
@@ -756,6 +831,9 @@ def main():
     elif dataset_type == 'ImageNet100':
         num_classes = 100
         input_size = (3, 224, 224)
+    elif dataset_type.lower() == 'tripletface':
+        num_classes = 512  # Use 512 for embedding dimension
+        input_size = (3, 224, 224)  # Standard size for face images
     else:
         raise ValueError(dataset_type)
     if len(args.input_size) != 0:
@@ -862,7 +940,7 @@ def main():
         if distributed:
             logger.error('Using distribute mode in test, abort')
             return
-        test(model_without_ddp, data_loader_test, input_size, args, logger)
+        test_triplet(model_without_ddp, data_loader_test, args.print_freq, logger)
         return
 
     ##################################################
@@ -891,8 +969,8 @@ def main():
                 scheduler_per_epoch.step()
 
         with Timer(' Test', logger):
-            test_loss, test_acc = evaluate_triplet(model, data_loader_test,  # Notice no criterion here
-                                          args.print_freq, logger)
+            test_loss, test_acc = test_triplet(model, data_loader_test, args.print_freq, logger)
+
             # Only returns loss and accuracy, not test_acc5
 
         if is_main_process() and tb_writer is not None:
@@ -909,11 +987,38 @@ def main():
         if lr_scheduler is not None:
             checkpoint['lr_scheduler'] = lr_scheduler.state_dict()
         # custom scheduler
+        
+         # --- save “best” checkpoint ---
+        if test_acc > max_acc1:
+            max_acc1 = test_acc
+            best_ckpt = {
+                'model': model_without_ddp.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'epoch': epoch,
+                'max_acc1': max_acc1,
+            }
+            if lr_scheduler is not None:
+                best_ckpt['lr_scheduler'] = lr_scheduler.state_dict()
+            save_on_master(
+                best_ckpt,
+                os.path.join(args.output_dir, 'checkpoint_max_acc1.pth')
+            )
 
+        # optional: also save the latest
         if args.save_latest:
-            save_on_master(checkpoint, os.path.join(args.output_dir, 'checkpoint_latest.pth'))
-
-    logger.info('Training completed.')
+            latest_ckpt = {
+                'model': model_without_ddp.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'epoch': epoch,
+                'max_acc1': max_acc1,
+            }
+            if lr_scheduler is not None:
+                latest_ckpt['lr_scheduler'] = lr_scheduler.state_dict()
+            save_on_master(
+                latest_ckpt,
+                os.path.join(args.output_dir, 'checkpoint_latest.pth')
+            )
+            logger.info('Training completed.')
 
     ##################################################
     #                   test
@@ -952,7 +1057,7 @@ def main():
     ##### test #####
 
     if is_main_process():
-        test(model, data_loader_test, input_size, args, logger)
+        test_triplet(model.cuda(), data_loader_test, args.print_freq, logger)
     logger.info('All Done.')
 
 
