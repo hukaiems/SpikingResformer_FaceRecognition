@@ -12,151 +12,30 @@ from spikingjelly.activation_based import functional
 import models.spikingresformer
 
 class LFWPairsDataset(Dataset):
-    """Custom LFW pairs dataset that works with standard LFW directory structure"""
-    
-    def __init__(self, lfw_root, transform=None, download_pairs=True):
+    def __init__(self, lfw_root, transform=None, download_pairs=True, pairs_file=None):
         self.lfw_root = lfw_root
         self.transform = transform
         self.pairs = []
         
-        # Download and create pairs file if needed
-        pairs_file = os.path.join(lfw_root, 'pairs.txt')
-        
-        if not os.path.exists(pairs_file) and download_pairs:
-            print("Downloading LFW pairs.txt file...")
-            self._download_pairs_file(pairs_file)
-        
-        if not os.path.exists(pairs_file):
-            print("Creating default pairs from available images...")
-            self._create_default_pairs()
-        else:
-            print(f"Loading pairs from {pairs_file}")
+        # Use custom pairs file if provided
+        if pairs_file and os.path.exists(pairs_file):
+            print(f"Loading pairs from custom file: {pairs_file}")
             self._load_pairs_from_file(pairs_file)
+        else:
+            # Original behavior
+            pairs_file = os.path.join(lfw_root, 'pairs.txt')
+            if not os.path.exists(pairs_file) and download_pairs:
+                print("Downloading LFW pairs.txt file...")
+                self._download_pairs_file(pairs_file)
             
-        print(f"Loaded {len(self.pairs)} pairs")
-    
-    def _download_pairs_file(self, pairs_file):
-        """Download the official LFW pairs.txt file"""
-        try:
-            import urllib.request
-            url = "http://vis-www.cs.umass.edu/lfw/pairs.txt"
-            urllib.request.urlretrieve(url, pairs_file)
-            print(f"Downloaded pairs.txt to {pairs_file}")
-        except Exception as e:
-            print(f"Failed to download pairs.txt: {e}")
-    
-    def _load_pairs_from_file(self, pairs_file):
-        """Load pairs from the official pairs.txt file"""
-        with open(pairs_file, 'r') as f:
-            lines = f.readlines()
-        
-        # Parse the file
-        line_idx = 0
-        while line_idx < len(lines):
-            line = lines[line_idx].strip()
-            if not line or line.startswith('#'):
-                line_idx += 1
-                continue
-                
-            parts = line.split()
-            if len(parts) == 1 and parts[0].isdigit():
-                # This is a header line indicating number of same pairs
-                num_same_pairs = int(parts[0])
-                line_idx += 1
-                
-                # Read same person pairs
-                for _ in range(num_same_pairs):
-                    if line_idx >= len(lines):
-                        break
-                    line = lines[line_idx].strip()
-                    parts = line.split()
-                    if len(parts) == 3:
-                        name, idx1, idx2 = parts
-                        img1_path = os.path.join(self.lfw_root, name, f"{name}_{idx1.zfill(4)}.jpg")
-                        img2_path = os.path.join(self.lfw_root, name, f"{name}_{idx2.zfill(4)}.jpg")
-                        if os.path.exists(img1_path) and os.path.exists(img2_path):
-                            self.pairs.append((img1_path, img2_path, 1))
-                    line_idx += 1
-                
-                # Read different person pairs (rest of the file)
-                while line_idx < len(lines):
-                    line = lines[line_idx].strip()
-                    if line and not line.startswith('#'):
-                        parts = line.split()
-                        if len(parts) == 4:
-                            name1, idx1, name2, idx2 = parts
-                            img1_path = os.path.join(self.lfw_root, name1, f"{name1}_{idx1.zfill(4)}.jpg")
-                            img2_path = os.path.join(self.lfw_root, name2, f"{name2}_{idx2.zfill(4)}.jpg")
-                            if os.path.exists(img1_path) and os.path.exists(img2_path):
-                                self.pairs.append((img1_path, img2_path, 0))
-                    line_idx += 1
-                break
+            if not os.path.exists(pairs_file):
+                print("Creating default pairs from available images...")
+                self._create_default_pairs()
             else:
-                line_idx += 1
-    
-    def _create_default_pairs(self):
-        """Create a default set of pairs from available images"""
-        print("Creating default pairs from directory structure...")
+                print(f"Loading pairs from {pairs_file}")
+                self._load_pairs_from_file(pairs_file)
         
-        # Get all person directories
-        person_dirs = []
-        for item in os.listdir(self.lfw_root):
-            person_path = os.path.join(self.lfw_root, item)
-            if os.path.isdir(person_path):
-                images = [f for f in os.listdir(person_path) if f.endswith('.jpg')]
-                if len(images) >= 2:
-                    person_dirs.append((item, images))
-        
-        # Create same person pairs
-        same_pairs = 0
-        for person, images in person_dirs:
-            if len(images) >= 2:
-                # Take first two images
-                img1 = os.path.join(self.lfw_root, person, images[0])
-                img2 = os.path.join(self.lfw_root, person, images[1])
-                self.pairs.append((img1, img2, 1))
-                same_pairs += 1
-                if same_pairs >= 300:  # Limit to 300 same pairs
-                    break
-        
-        # Create different person pairs
-        diff_pairs = 0
-        for i, (person1, images1) in enumerate(person_dirs):
-            for j, (person2, images2) in enumerate(person_dirs[i+1:], i+1):
-                img1 = os.path.join(self.lfw_root, person1, images1[0])
-                img2 = os.path.join(self.lfw_root, person2, images2[0])
-                self.pairs.append((img1, img2, 0))
-                diff_pairs += 1
-                if diff_pairs >= 300:  # Limit to 300 different pairs
-                    break
-            if diff_pairs >= 300:
-                break
-        
-        print(f"Created {same_pairs} same person pairs and {diff_pairs} different person pairs")
-    
-    def __len__(self):
-        return len(self.pairs)
-    
-    def __getitem__(self, idx):
-        img1_path, img2_path, label = self.pairs[idx]
-        
-        # Load images
-        try:
-            img1 = Image.open(img1_path).convert('RGB')
-            img2 = Image.open(img2_path).convert('RGB')
-        except Exception as e:
-            print(f"Error loading images: {img1_path}, {img2_path}")
-            print(f"Error: {e}")
-            # Return dummy images
-            img1 = Image.new('RGB', (224, 224))
-            img2 = Image.new('RGB', (224, 224))
-        
-        # Apply transforms
-        if self.transform:
-            img1 = self.transform(img1)
-            img2 = self.transform(img2)
-        
-        return (img1, img2), label
+        print(f"Loaded {len(self.pairs)} pairs")
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Evaluate on LFW')
@@ -174,6 +53,8 @@ def parse_args():
                         help='Model input size (H W)')
     parser.add_argument('--embed-dim', type=int, default=512,
                         help='Embedding dimension')
+    parser.add_argument('--pairs-file', type=str, default=None,
+                       help='Path to pairs.txt file (if in a different location)')
     return parser.parse_args()
 
 def extract_embeddings(model, image, T):
@@ -232,7 +113,11 @@ def main():
     
     # 2. Load LFW pairs dataset with custom implementation
     print("\nLoading LFW pairs dataset...")
-    dataset = LFWPairsDataset(lfw_root=args.lfw_root, transform=val_transforms)
+    dataset = LFWPairsDataset(
+        lfw_root=args.lfw_root, 
+        transform=val_transforms,
+        pairs_file=args.pairs_file
+    )
     
     print(f"Dataset loaded with {len(dataset)} pairs")
     if len(dataset) == 0:
