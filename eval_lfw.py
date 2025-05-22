@@ -223,7 +223,7 @@ def main():
     ])
     
     # 2. Load LFW pairs dataset with custom implementation
-    dataset = LFWPairsDataset(root=args.lfw_root, transform=val_transforms)
+    dataset = LFWPairsDataset(lfw_root=args.lfw_root, transform=val_transforms)
     
     loader = DataLoader(dataset,
                         batch_size=args.batch_size,
