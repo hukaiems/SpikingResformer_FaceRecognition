@@ -9,6 +9,7 @@ from timm.models import create_model
 from sklearn.metrics import roc_curve, auc, accuracy_score
 import numpy as np
 from spikingjelly.activation_based import functional
+import models.spikingresformer
 
 class LFWPairsDataset(Dataset):
     """Custom LFW pairs dataset that works with standard LFW directory structure"""
