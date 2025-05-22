@@ -213,6 +213,13 @@ def main():
     print(f"Found {len(subdirs)} person directories")
     if len(subdirs) > 0:
         print(f"Sample directories: {subdirs[:5]}")
+        
+        # Check a sample person directory
+        sample_dir = os.path.join(args.lfw_root, subdirs[0])
+        sample_files = [f for f in os.listdir(sample_dir) if f.endswith('.jpg')]
+        print(f"Sample person '{subdirs[0]}' has {len(sample_files)} images")
+        if len(sample_files) > 0:
+            print(f"Sample image names: {sample_files[:3]}")
     
     # 1. Define transforms (same as training)
     val_transforms = transforms.Compose([
@@ -224,7 +231,22 @@ def main():
     ])
     
     # 2. Load LFW pairs dataset with custom implementation
+    print("\nLoading LFW pairs dataset...")
     dataset = LFWPairsDataset(lfw_root=args.lfw_root, transform=val_transforms)
+    
+    print(f"Dataset loaded with {len(dataset)} pairs")
+    if len(dataset) == 0:
+        print("ERROR: No pairs were loaded from the dataset!")
+        return
+        
+    # Check a few sample pairs
+    print("\nChecking a few sample pairs:")
+    for i in range(min(3, len(dataset))):
+        try:
+            (img1, img2), label = dataset[i]
+            print(f"Sample {i}: img1 shape {img1.shape}, img2 shape {img2.shape}, label {label}")
+        except Exception as e:
+            print(f"Error loading sample {i}: {e}")
     
     loader = DataLoader(dataset,
                         batch_size=args.batch_size,
@@ -232,46 +254,61 @@ def main():
                         num_workers=args.num_workers,
                         pin_memory=True)
     
+    print(f"\nDataLoader created with {len(loader)} batches")
+    
     # 3. Model initialization
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
     # Create model with embedding output (not classification)
-    model = create_model(
-        args.model,
-        T=args.T,
-        num_classes=args.embed_dim,  # Use embedding dimension as output
-        img_size=args.input_size[0],
-    )
+    try:
+        model = create_model(
+            args.model,
+            T=args.T,
+            num_classes=args.embed_dim,  # Use embedding dimension as output
+            img_size=args.input_size[0],
+        )
+        print(f"Model created successfully: {args.model}")
+    except Exception as e:
+        print(f"Error creating model: {e}")
+        return
     
     if torch.cuda.is_available():
         model = model.cuda()
     
     # Load checkpoint
     print(f"Loading checkpoint from {args.checkpoint}")
-    ckpt = torch.load(args.checkpoint, map_location=device)
+    try:
+        ckpt = torch.load(args.checkpoint, map_location=device)
+        print(f"Checkpoint loaded. Keys in checkpoint: {list(ckpt.keys())}")
+        
+        # Handle different checkpoint structures
+        if 'model' in ckpt:
+            state_dict = ckpt['model']
+        elif 'state_dict' in ckpt:
+            state_dict = ckpt['state_dict']
+        else:
+            state_dict = ckpt
+            
+        model.load_state_dict(state_dict)
+        print("Model state_dict loaded successfully")
+    except Exception as e:
+        print(f"Error loading checkpoint: {e}")
+        return
     
-    # Handle different checkpoint structures
-    if 'model' in ckpt:
-        state_dict = ckpt['model']
-    elif 'state_dict' in ckpt:
-        state_dict = ckpt['state_dict']
-    else:
-        state_dict = ckpt
-    
-    model.load_state_dict(state_dict)
     model.to(device).eval()
-    
     print(f"Model loaded successfully. Evaluating on LFW...")
-    print(f"Dataset size: {len(dataset)} pairs")
     
     # 4. Evaluate
     all_labels = []
     all_distances = []
     all_similarities = []
     
+    print("\nStarting evaluation loop...")
     with torch.no_grad():
+        batch_count = 0
         for batch_idx, ((img1, img2), labels) in enumerate(loader):
+            print(f"Processing batch {batch_idx}, size: {img1.shape}")
             img1, img2 = img1.to(device), img2.to(device)
             
             # Extract embeddings for both images
@@ -286,8 +323,18 @@ def main():
             all_similarities.append(similarities)
             all_labels.append(labels.numpy())
             
-            if (batch_idx + 1) % 10 == 0:
-                print(f"Processed {batch_idx + 1}/{len(loader)} batches")
+            batch_count += 1
+            if batch_count % 10 == 0:
+                print(f"Processed {batch_count}/{len(loader)} batches")
+    
+    print(f"\nProcessed total of {batch_count} batches")
+    print(f"all_distances length: {len(all_distances)}")
+    print(f"all_similarities length: {len(all_similarities)}")
+    print(f"all_labels length: {len(all_labels)}")
+    
+    if len(all_distances) == 0:
+        print("ERROR: No batches were processed during evaluation!")
+        return
     
     # Concatenate all results
     all_distances = np.concatenate(all_distances)
