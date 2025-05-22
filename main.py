@@ -38,9 +38,10 @@ from timm.loss import SoftTargetCrossEntropy
 from timm.optim import create_optimizer_v2
 from timm.scheduler import create_scheduler_v2
 from timm.models import create_model
+
 from utils.triplet_face import TripletFaceDataset
 from utils.tripletloss import TripletLoss
-
+from torch.optim import lr_scheduler
 
 
 def parse_args():
@@ -886,14 +887,11 @@ def main():
 
     # lr scheduler
 
-    lr_scheduler, _ = create_scheduler_v2(
+    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        sched='cosine',
-        num_epochs=args.epochs,
-        cooldown_epochs=10,
-        min_lr=1e-5,
-        warmup_lr=1e-5,
-        warmup_epochs=3,
+        mode='max',      # Maximize accuracy
+        factor=0.1,      # Reduce learning rate by a factor of 0.1
+        patience=3       # Wait 3 epochs without improvement
     )
 
     # Sync BN
@@ -963,14 +961,16 @@ def main():
                                                                  data_loader_train, logger,
                                                                  args.print_freq, world_size,
                                                                  scheduler_per_iter, scaler)
-            if lr_scheduler is not None:
-                lr_scheduler.step(epoch + 1)
+            # if lr_scheduler is not None:
+            #     lr_scheduler.step(epoch + 1)
             if scheduler_per_epoch is not None:
                 scheduler_per_epoch.step()
 
         with Timer(' Test', logger):
             test_loss, test_acc = test_triplet(model, data_loader_test, args.print_freq, logger)
-
+            
+        if lr_scheduler is not None:
+            lr_scheduler.step(test_acc)
             # Only returns loss and accuracy, not test_acc5
 
         if is_main_process() and tb_writer is not None:
