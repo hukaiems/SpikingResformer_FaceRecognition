@@ -12,30 +12,82 @@ from spikingjelly.activation_based import functional
 import models.spikingresformer
 
 class LFWPairsDataset(Dataset):
-    def __init__(self, lfw_root, transform=None, download_pairs=True, pairs_file=None):
+    """LFW dataset that loads pairs from standard protocol files"""
+    
+    def __init__(self, lfw_root, transform=None, pairs_file=None):
         self.lfw_root = lfw_root
         self.transform = transform
         self.pairs = []
         
-        # Use custom pairs file if provided
-        if pairs_file and os.path.exists(pairs_file):
-            print(f"Loading pairs from custom file: {pairs_file}")
-            self._load_pairs_from_file(pairs_file)
-        else:
-            # Original behavior
-            pairs_file = os.path.join(lfw_root, 'pairs.txt')
-            if not os.path.exists(pairs_file) and download_pairs:
-                print("Downloading LFW pairs.txt file...")
-                self._download_pairs_file(pairs_file)
+        if not pairs_file or not os.path.exists(pairs_file):
+            raise ValueError(f"Must provide a valid pairs file path. Got: {pairs_file}")
             
-            if not os.path.exists(pairs_file):
-                print("Creating default pairs from available images...")
-                self._create_default_pairs()
-            else:
-                print(f"Loading pairs from {pairs_file}")
-                self._load_pairs_from_file(pairs_file)
-        
+        print(f"Loading pairs from: {pairs_file}")
+        self._load_pairs_from_file(pairs_file)
         print(f"Loaded {len(self.pairs)} pairs")
+    
+    def _load_pairs_from_file(self, pairs_file):
+        """Load pairs from LFW protocol file"""
+        with open(pairs_file, 'r') as f:
+            lines = f.readlines()
+        
+        # First line contains the number of pairs in some files
+        first_line = lines[0].strip()
+        start_idx = 1 if first_line.isdigit() else 0
+        
+        # Process remaining lines
+        for line_idx in range(start_idx, len(lines)):
+            line = lines[line_idx].strip()
+            if not line or line.startswith('#'):
+                continue
+                
+            parts = line.split()
+            
+            # Format: name idx1 idx2 (same person)
+            if len(parts) == 3:
+                name, idx1, idx2 = parts
+                img1_path = os.path.join(self.lfw_root, name, f"{name}_{idx1.zfill(4)}.jpg")
+                img2_path = os.path.join(self.lfw_root, name, f"{name}_{idx2.zfill(4)}.jpg")
+                
+                if os.path.exists(img1_path) and os.path.exists(img2_path):
+                    self.pairs.append((img1_path, img2_path, 1))
+                else:
+                    print(f"Warning: Could not find images for {name} {idx1} {idx2}")
+                    
+            # Format: name1 idx1 name2 idx2 (different people)
+            elif len(parts) == 4:
+                name1, idx1, name2, idx2 = parts
+                img1_path = os.path.join(self.lfw_root, name1, f"{name1}_{idx1.zfill(4)}.jpg")
+                img2_path = os.path.join(self.lfw_root, name2, f"{name2}_{idx2.zfill(4)}.jpg")
+                
+                if os.path.exists(img1_path) and os.path.exists(img2_path):
+                    self.pairs.append((img1_path, img2_path, 0))
+                else:
+                    print(f"Warning: Could not find images for {name1} {idx1} and {name2} {idx2}")
+    
+    def __len__(self):
+        return len(self.pairs)
+    
+    def __getitem__(self, idx):
+        img1_path, img2_path, label = self.pairs[idx]
+        
+        # Load images
+        try:
+            img1 = Image.open(img1_path).convert('RGB')
+            img2 = Image.open(img2_path).convert('RGB')
+        except Exception as e:
+            print(f"Error loading images: {img1_path}, {img2_path}")
+            print(f"Error: {e}")
+            # Return dummy images
+            img1 = Image.new('RGB', (224, 224))
+            img2 = Image.new('RGB', (224, 224))
+        
+        # Apply transforms
+        if self.transform:
+            img1 = self.transform(img1)
+            img2 = self.transform(img2)
+        
+        return (img1, img2), label
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Evaluate on LFW')
