@@ -88,6 +88,7 @@ def parse_args():
                         help='Path to training triplet list txt file')
     parser.add_argument('--triplet-list-val',   type=str, default='',
                         help='Path to validation triplet list txt file')
+    parser.add_argument('--triplet-margin', default=0.2, type=float, help='Margin for triplet loss')
 
 
     # argument of TET
@@ -870,7 +871,7 @@ def main():
 
     # loss_fn
 
-    margin = 0.2  # You can make this configurable through args
+    margin = args.triplet_margin  # You can make this configurable through args
     criterion = TripletLoss(margin=margin)
     criterion_eval = TripletLoss(margin=margin)  # Same loss for evaluation
 
@@ -968,7 +969,7 @@ def main():
 
         with Timer(' Test', logger):
             test_loss, test_acc = test_triplet(model, data_loader_test, args.print_freq, logger)
-            
+
         if lr_scheduler is not None:
             lr_scheduler.step(test_acc)
             # Only returns loss and accuracy, not test_acc5
