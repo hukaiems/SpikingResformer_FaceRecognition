@@ -554,7 +554,9 @@ def train_one_epoch_triplet(
             else:
                 embeddings = model(images)
                 loss = criterion(embeddings)
-
+            
+            print("Embeddings mean:", embeddings.mean().item())
+            print("Embeddings std:", embeddings.std().item())
             metric_dict['loss'].update(loss.item())
 
             # Backward + step
