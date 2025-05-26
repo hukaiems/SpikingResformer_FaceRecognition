@@ -1,4 +1,4 @@
-#import os - phuoc doi
+import os
 import time
 import yaml
 import random
@@ -920,12 +920,17 @@ def main():
         model_without_ddp.load_state_dict(checkpoint['model'])
         optimizer.load_state_dict(checkpoint['optimizer'])
         start_epoch = checkpoint['epoch']
-        max_acc1 = checkpoint['max_acc1']
+        max_acc1 = checkpoint.get('max_acc1', 0)
         if lr_scheduler is not None:
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+        # SỬA: Thêm nạp scaler state
+        if scaler is not None and 'scaler' in checkpoint:
+            scaler.load_state_dict(checkpoint['scaler'])
+        # SỬA: Thêm nạp scheduler_per_iter state  
+        if scheduler_per_iter is not None and 'scheduler_per_iter' in checkpoint:
+            scheduler_per_iter.load_state_dict(checkpoint['scheduler_per_iter'])
         logger.info('Resume from epoch {}'.format(start_epoch))
         start_epoch += 1
-        # custom scheduler
     else:
         start_epoch = 0
         max_acc1 = 0
@@ -979,46 +984,50 @@ def main():
 
         logger.info(' Test loss: {:.5f}, Accuracy: {:.5f}'.format(test_loss, test_acc))
 
-        checkpoint = {
-            'model': model_without_ddp.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'epoch': epoch,
-            'max_acc1': max_acc1, }
-        if lr_scheduler is not None:
-            checkpoint['lr_scheduler'] = lr_scheduler.state_dict()
-        # custom scheduler
-        
-         # --- save “best” checkpoint ---
-        if test_acc > max_acc1:
-            max_acc1 = test_acc
-            best_ckpt = {
+        # Hàm tạo checkpoint đầy đủ
+        def create_full_checkpoint(epoch, max_acc1):
+            ckpt = {
                 'model': model_without_ddp.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'epoch': epoch,
                 'max_acc1': max_acc1,
             }
             if lr_scheduler is not None:
-                best_ckpt['lr_scheduler'] = lr_scheduler.state_dict()
+                ckpt['lr_scheduler'] = lr_scheduler.state_dict()
+            if scaler is not None:
+                ckpt['scaler'] = scaler.state_dict()
+            if scheduler_per_iter is not None:
+                ckpt['scheduler_per_iter'] = scheduler_per_iter.state_dict()
+            return ckpt
+
+        # Lưu best checkpoint
+        if test_acc > max_acc1:
+            max_acc1 = test_acc
+            best_ckpt = create_full_checkpoint(epoch, max_acc1)
             save_on_master(
                 best_ckpt,
                 os.path.join(args.output_dir, 'checkpoint_max_acc1.pth')
             )
+            logger.info('New best accuracy: {:.5f}'.format(max_acc1))
 
-        # optional: also save the latest
+        # Lưu latest checkpoint
         if args.save_latest:
-            latest_ckpt = {
-                'model': model_without_ddp.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'epoch': epoch,
-                'max_acc1': max_acc1,
-            }
-            if lr_scheduler is not None:
-                latest_ckpt['lr_scheduler'] = lr_scheduler.state_dict()
+            latest_ckpt = create_full_checkpoint(epoch, max_acc1)
             save_on_master(
                 latest_ckpt,
                 os.path.join(args.output_dir, 'checkpoint_latest.pth')
             )
-            logger.info('Training completed.')
+
+        # Lưu checkpoint định kỳ mỗi 10 epoch
+        if (epoch + 1) % 10 == 0:
+            periodic_ckpt = create_full_checkpoint(epoch, max_acc1)
+            save_on_master(
+                periodic_ckpt,
+                os.path.join(args.output_dir, f'checkpoint_epoch_{epoch}.pth')
+            )
+            logger.info('Saved periodic checkpoint at epoch {}'.format(epoch))
+
+    logger.info('Training completed.')
 
     ##################################################
     #                   test
@@ -1033,7 +1042,7 @@ def main():
     model = create_model(
         args.model,
         T=args.T,
-        num_classes=512,
+        num_classes=num_classes,  # SỬA: Dùng num_classes thay vì hard-code 512
         img_size=input_size[-1],
     )
 
