@@ -25,20 +25,13 @@ def align_and_crop(img_input: Union[str, Image.Image], target_size=(160, 160)) -
     # Use MTCNN for face detection and alignment
     mtcnn = _get_mtcnn()
     aligned = mtcnn(img)  # returns a torch.Tensor or None
-    if aligned is None:
-        # Fallback: resize original image
+    if aligned is None or not isinstance(aligned, torch.Tensor):
+        print("Warning: MTCNN failed, fallback to original image")
         return img.resize(target_size)
-    
-    # Check if the aligned image is too small
-    if aligned.shape[1] < 10 or aligned.shape[2] < 10:
-        print(f"Warning: Aligned image too small: {aligned.shape}, falling back to original")
-        return img.resize(target_size)
-    
-    # Convert to PIL with correct dtype (uint8)
-    aligned_pil = Image.fromarray(aligned.permute(1, 2, 0).byte().numpy())
-    
-    # Resize to target size if different from MTCNN's default (160x160)
+    if aligned.is_cuda:
+        aligned = aligned.cpu()
+        aligned = aligned.permute(1, 2, 0).mul(255).byte().numpy()
+        aligned_pil = Image.fromarray(aligned)
     if target_size != (160, 160):
         aligned_pil = aligned_pil.resize(target_size)
-    
     return aligned_pil
