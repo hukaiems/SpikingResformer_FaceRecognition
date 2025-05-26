@@ -40,6 +40,8 @@ from timm.scheduler import create_scheduler_v2
 from timm.models import create_model
 from utils.triplet_face import TripletFaceDataset
 from utils.tripletloss import TripletLoss
+# alignement
+from utils.face_alignment import align_and_crop
 
 
 
@@ -353,23 +355,34 @@ def load_data(
                                                        sampler=test_sampler, num_workers=workers,
                                                        pin_memory=True, drop_last=False)
     elif dataset_type.lower() == 'tripletface':
-        # common transforms
+        # Since face alignment is handled in the dataset, we can simplify transforms
+        # Remove Resize and CenterCrop since align_and_crop handles sizing
         transform = transforms.Compose([
-            transforms.Resize(input_size[-2:]),
-            transforms.CenterCrop(input_size[-2:]),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485,0.456,0.406],
-                                std=[0.229,0.224,0.225]),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                               std=[0.229, 0.224, 0.225]),
         ])
-        # train set
-        train_ds = TripletFaceDataset(triplet_list_train, transform=transform)
+        
+        # Create datasets with face alignment enabled
+        train_ds = TripletFaceDataset(
+            triplet_list_train, 
+            transform=transform,
+            use_face_alignment=True,  # Enable face alignment
+            target_size=input_size[-2:]  # Use input size from args (should be (224, 224))
+        )
         data_loader_train = torch.utils.data.DataLoader(
             train_ds, batch_size=batch_size,
             shuffle=True, num_workers=workers,
             pin_memory=True, drop_last=True,
         )
+        
         # val/test set
-        val_ds = TripletFaceDataset(triplet_list_val, transform=transform)
+        val_ds = TripletFaceDataset(
+            triplet_list_val, 
+            transform=transform,
+            use_face_alignment=True,  # Enable face alignment
+            target_size=input_size[-2:]  # Use input size from args
+        )
         data_loader_test = torch.utils.data.DataLoader(
             val_ds, batch_size=batch_size,
             shuffle=False, num_workers=workers,
