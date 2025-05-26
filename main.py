@@ -555,8 +555,10 @@ def train_one_epoch_triplet(
                 embeddings = model(images)
                 loss = criterion(embeddings)
             
+        if idx == 0:  # Only print for the first batch
             print("Embeddings mean:", embeddings.mean().item())
             print("Embeddings std:", embeddings.std().item())
+
             metric_dict['loss'].update(loss.item())
 
             # Backward + step
