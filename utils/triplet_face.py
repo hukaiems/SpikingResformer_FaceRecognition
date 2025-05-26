@@ -33,19 +33,31 @@ class TripletFaceDataset(Dataset):
 
     def __getitem__(self, idx):
         a_path, p_path, n_path = self.triplets[idx]
-        a = Image.open(a_path).convert('RGB')
-        p = Image.open(p_path).convert('RGB')
-        n = Image.open(n_path).convert('RGB')
-
+        
         if self.use_face_alignment:
             try:
-                a = align_and_crop(a, target_size=self.target_size)
-                p = align_and_crop(p, target_size=self.target_size)
-                n = align_and_crop(n, target_size=self.target_size)
+                # Pass file paths directly to align_and_crop
+                a = align_and_crop(a_path)
+                p = align_and_crop(p_path)
+                n = align_and_crop(n_path)
+                
+                # If target_size is different from 160x160, resize
+                if self.target_size != (160, 160):
+                    a = a.resize(self.target_size)
+                    p = p.resize(self.target_size)
+                    n = n.resize(self.target_size)
+                    
             except Exception as e:
                 # If face alignment fails, fall back to original images
                 print(f"Face alignment failed for triplet {idx}: {e}")
-                # Keep original images and let transforms handle resizing
+                a = Image.open(a_path).convert('RGB')
+                p = Image.open(p_path).convert('RGB')
+                n = Image.open(n_path).convert('RGB')
+        else:
+            # Load images normally without face alignment
+            a = Image.open(a_path).convert('RGB')
+            p = Image.open(p_path).convert('RGB')
+            n = Image.open(n_path).convert('RGB')
 
         return (
             self.transform(a),
