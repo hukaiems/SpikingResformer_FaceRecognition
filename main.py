@@ -215,7 +215,7 @@ def load_data(
             pin_memory=True,
             drop_last=True,
             sampler=train_sampler,
-            collate_fn=custom_collate  # Add custom collate
+            # collate_fn=custom_collate  # Add custom collate
         )
         
         val_ds = TripletFaceDataset(
@@ -236,7 +236,7 @@ def load_data(
             pin_memory=True,
             drop_last=False,
             sampler=test_sampler,
-            collate_fn=custom_collate  # Add custom collate
+            # collate_fn=custom_collate  # Add custom collate
         )
         dataset_train, dataset_test = train_ds, val_ds
         
