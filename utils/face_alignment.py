@@ -8,11 +8,19 @@ import torch
 _mtcnn = None
 
 def _get_mtcnn():
-    """Get MTCNN instance, creating one per process if needed"""
+    """Get MTCNN instance with strict configuration"""
     global _mtcnn
     if _mtcnn is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        _mtcnn = MTCNN(image_size=160, margin=0, keep_all=False, device=device)
+        # Strict configuration for high-quality face detection
+        _mtcnn = MTCNN(
+            image_size=160, 
+            margin=30,              # More padding around face
+            keep_all=False, 
+            min_face_size=50,       # Larger minimum face size
+            thresholds=[0.8, 0.9, 0.9],  # Stricter thresholds
+            device=device
+        )
     return _mtcnn
 
 def align_and_crop(img_input: Union[str, Image.Image], target_size=(224, 224)) -> Image.Image:
