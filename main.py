@@ -549,15 +549,24 @@ def train_one_epoch_triplet(
             # Forward + loss
             if scaler is not None:
                 with autocast():
-                    embeddings = model(images)
+                    anchor_emb = model(anchor)
+                    positive_emb = model(positive) 
+                    negative_emb = model(negative)
+
+                    embeddings = torch.cat([anchor_emb, positive_emb, negative_emb], dim=1)
                     loss = criterion(embeddings)
             else:
-                embeddings = model(images)
+                anchor_emb = model(anchor)
+                positive_emb = model(positive)
+                negative_emb = model(negative)
+                
+                # Concatenate embeddings for loss computation
+                embeddings = torch.cat([anchor_emb, positive_emb, negative_emb], dim=1)
                 loss = criterion(embeddings)
             
-        if idx == 0:  # Only print for the first batch
-            print("Embeddings mean:", embeddings.mean().item())
-            print("Embeddings std:", embeddings.std().item())
+            if idx == 0:  # Only print for the first batch
+                print("Embeddings mean:", embeddings.mean().item())
+                print("Embeddings std:", embeddings.std().item())
 
             metric_dict['loss'].update(loss.item())
 
@@ -577,6 +586,10 @@ def train_one_epoch_triplet(
                 scheduler_per_iter.step()
 
             functional.reset_net(model)
+
+            # garbage collector
+            if idx % 10 == 0:
+                torch.cuda.empty_cache()
 
         # Logging
         batch_size = anchor.size(0)
