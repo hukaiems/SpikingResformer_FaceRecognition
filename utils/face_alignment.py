@@ -4,7 +4,6 @@ from PIL import Image
 from typing import Union
 import torch
 
-# Global variable to store MTCNN instance per process
 _mtcnn = None
 
 def _get_mtcnn():
@@ -12,13 +11,12 @@ def _get_mtcnn():
     global _mtcnn
     if _mtcnn is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        # Strict configuration for high-quality face detection
         _mtcnn = MTCNN(
             image_size=160, 
-            margin=30,              # More padding around face
+            margin=30,
             keep_all=False, 
-            min_face_size=50,       # Larger minimum face size
-            thresholds=[0.8, 0.9, 0.9],  # Stricter thresholds
+            min_face_size=50,
+            thresholds=[0.8, 0.9, 0.9],
             device=device
         )
     return _mtcnn
@@ -26,23 +24,28 @@ def _get_mtcnn():
 def align_and_crop(img_input: Union[str, Image.Image], target_size=(224, 224)) -> Image.Image:
     # Handle both file path and PIL Image inputs
     if isinstance(img_input, str):
-        img = Image.open(img_input).convert('RGB')
+        try:
+            img = Image.open(img_input).convert('RGB')
+        except Exception as e:
+            print(f"Error loading image {img_input}: {e}")
+            # Create a blank RGB image as fallback
+            img = Image.new('RGB', target_size, (128, 128, 128))
     else:
         img = img_input.convert('RGB')
     
     # Use MTCNN for face detection and alignment
     mtcnn = _get_mtcnn()
-    aligned = mtcnn(img)  # returns a torch.Tensor or None
+    try:
+        aligned = mtcnn(img)  # Returns a torch.Tensor or None
+    except Exception as e:
+        print(f"MTCNN failed for image: {e}")
+        aligned = None
 
     if aligned is None or not isinstance(aligned, torch.Tensor):
-        print("Warning: MTCNN failed, fallback to original image")
-        return img.resize(target_size)
+        print("Warning: MTCNN failed, falling back to resized image")
+        return img.resize(target_size, Image.BILINEAR)
     
-    # Make sure tensor is on cpu and dtype uint8 for PIL conversion
-    if aligned.is_cuda:
-        aligned = aligned.cpu()
-    # aligned has shape [3, 160, 160] and values in [0,1]
-    aligned = aligned.permute(1, 2, 0).mul(255).byte().numpy()
-    aligned_pil = Image.fromarray(aligned)
-    aligned_pil = aligned_pil.resize(target_size, Image.BILINEAR)
-    return aligned_pil
+    # Convert tensor to PIL Image
+    aligned = aligned.cpu().permute(1, 2, 0).mul(255).byte().numpy()
+    aligned_pil = Image.fromarray(aligned).convert('RGB')  # Ensure RGB
+    return aligned_pil.resize(target_size, Image.BILINEAR)

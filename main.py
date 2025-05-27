@@ -161,6 +161,18 @@ def _get_cache_path(filepath):
     return cache_path
 
 
+def custom_collate(batch):
+    anchors, positives, negatives = zip(*batch)
+    anchor_shapes = [a.shape for a in anchors]
+    positive_shapes = [p.shape for p in positives]
+    negative_shapes = [n.shape for n in negatives]
+    print(f"Batch shapes - Anchors: {anchor_shapes}, Positives: {positive_shapes}, Negatives: {negative_shapes}")
+    try:
+        return torch.stack(anchors), torch.stack(positives), torch.stack(negatives)
+    except RuntimeError as e:
+        print(f"Collate error: {e}")
+        raise
+
 def load_data(
     dataset_dir: str,
     batch_size: int,
@@ -175,42 +187,56 @@ def load_data(
     label_smoothing: float,
     T: int,
     triplet_list_train: str,
-    triplet_list_val:   str,  
+    triplet_list_val: str,  
 ):
-
     if dataset_type.lower() == 'tripletface':
-        # Since face alignment is handled in the dataset, we can simplify transforms
-        # Remove Resize and CenterCrop since align_and_crop handles sizing
         transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                               std=[0.229, 0.224, 0.225]),
+                                 std=[0.229, 0.224, 0.225]),
         ])
         
-        # Create datasets with face alignment enabled
         train_ds = TripletFaceDataset(
             triplet_list_train, 
             transform=transform,
-            use_face_alignment=True,  # Enable face alignment
-            target_size=input_size[-2:]  # Use input size from args (should be (224, 224))
+            use_face_alignment=True,
+            target_size=input_size[-2:]
         )
+        # Add DistributedSampler for distributed training
+        if distributed:
+            train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds)
+        else:
+            train_sampler = None
+            
         data_loader_train = torch.utils.data.DataLoader(
             train_ds, batch_size=batch_size,
-            shuffle=True, num_workers=workers,
-            pin_memory=True, drop_last=True,
+            shuffle=(train_sampler is None),
+            num_workers=workers,
+            pin_memory=True,
+            drop_last=True,
+            sampler=train_sampler,
+            collate_fn=custom_collate  # Add custom collate
         )
         
-        # val/test set
         val_ds = TripletFaceDataset(
             triplet_list_val, 
             transform=transform,
-            use_face_alignment=True,  # Enable face alignment
-            target_size=input_size[-2:]  # Use input size from args
+            use_face_alignment=True,
+            target_size=input_size[-2:]
         )
+        if distributed:
+            test_sampler = torch.utils.data.distributed.DistributedSampler(val_ds, shuffle=False)
+        else:
+            test_sampler = None
+            
         data_loader_test = torch.utils.data.DataLoader(
             val_ds, batch_size=batch_size,
-            shuffle=False, num_workers=workers,
-            pin_memory=True, drop_last=False,
+            shuffle=False,
+            num_workers=workers,
+            pin_memory=True,
+            drop_last=False,
+            sampler=test_sampler,
+            collate_fn=custom_collate  # Add custom collate
         )
         dataset_train, dataset_test = train_ds, val_ds
         
