@@ -162,10 +162,18 @@ def _get_cache_path(filepath):
 
 
 def load_data(
+    dataset_dir: str,
     batch_size: int,
     workers: int,
+    num_classes: int,
     dataset_type: str,
     input_size: Tuple[int],
+    distributed: bool,
+    augment: str,
+    mixup: bool,
+    cutout: bool,
+    label_smoothing: float,
+    T: int,
     triplet_list_train: str,
     triplet_list_val:   str,  
 ):
@@ -205,7 +213,7 @@ def load_data(
             pin_memory=True, drop_last=False,
         )
         dataset_train, dataset_test = train_ds, val_ds
-
+        
     else:
         raise ValueError(dataset_type)
 
