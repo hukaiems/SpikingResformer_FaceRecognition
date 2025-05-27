@@ -326,13 +326,13 @@ def train_one_epoch_triplet(
     return metric_dict['loss'].ave
 
 
-def evaluate_triplet(model, data_loader, print_freq, logger):
+def evaluate_triplet(model, data_loader, print_freq, logger, criterion_eval):
     model.eval()
     metric_dict = RecordDict({'loss': None, 'accuracy': None})
     with torch.no_grad():
         for idx, (anchor, positive, negative) in enumerate(data_loader):
             # Move to GPU
-            anchor   = anchor.cuda()
+            anchor = anchor.cuda()
             positive = positive.cuda()
             negative = negative.cuda()
 
@@ -342,13 +342,17 @@ def evaluate_triplet(model, data_loader, print_freq, logger):
             # Forward pass: embeddings shape [T, 3*B, embed_dim]
             embeddings = model(images)
 
+            # Compute loss using criterion_eval
+            loss = criterion_eval(embeddings)
+            metric_dict['loss'].update(loss.item())
+
             # Reshape to [T, B, 3, embed_dim]
             T, total, embed_dim = embeddings.shape
             B = total // 3
             embeddings = embeddings.reshape(T, B, 3, embed_dim)
 
             # Split out the triplet views
-            anchor_e   = embeddings[:, :, 0]  # [T, B, embed_dim]
+            anchor_e = embeddings[:, :, 0]  # [T, B, embed_dim]
             positive_e = embeddings[:, :, 1]
             negative_e = embeddings[:, :, 2]
 
@@ -356,15 +360,11 @@ def evaluate_triplet(model, data_loader, print_freq, logger):
             pos_dist = torch.sum((anchor_e - positive_e) ** 2, dim=-1)
             neg_dist = torch.sum((anchor_e - negative_e) ** 2, dim=-1)
 
-            # Triplet loss: margin=0.2
-            loss = torch.clamp(pos_dist - neg_dist + 0.2, min=0).mean()
-            metric_dict['loss'].update(loss.item())
-
             # Accuracy: fraction of (pos_dist < neg_dist)
             correct = (pos_dist < neg_dist).float().mean()
             metric_dict['accuracy'].update(correct.item(), B)
 
-            # reset spiking states
+            # Reset spiking states
             functional.reset_net(model)
 
             # Logging
@@ -384,6 +384,7 @@ def test_triplet(
     data_loader_test: torch.utils.data.DataLoader,
     print_freq: int,
     logger: logging.Logger,
+    criterion_eval,
     margin: float = 0.2,
 ):
     model.eval()
@@ -391,13 +392,17 @@ def test_triplet(
     with torch.no_grad():
         for idx, (anchor, positive, negative) in enumerate(data_loader_test):
             # Move all to GPU
-            anchor   = anchor.cuda()
+            anchor = anchor.cuda()
             positive = positive.cuda()
             negative = negative.cuda()
 
             # Build a single batch
             images = torch.cat([anchor, positive, negative], dim=0)
             embeddings = model(images)  # [T, 3*B, D]
+
+            # Compute loss using criterion_eval
+            loss = criterion_eval(embeddings)
+            metric_dict['loss'].update(loss.item())
 
             # Reshape to separate triplets
             T, total, D = embeddings.shape
@@ -411,11 +416,8 @@ def test_triplet(
             pos_dist = torch.sum((a_e - p_e) ** 2, dim=-1)  # [T, B]
             neg_dist = torch.sum((a_e - n_e) ** 2, dim=-1)  # [T, B]
 
-            # Triplet loss + accuracy
-            loss = torch.clamp(pos_dist - neg_dist + margin, min=0).mean()
+            # Accuracy
             correct = (pos_dist < neg_dist).float().mean()
-
-            metric_dict['loss'].update(loss.item())
             metric_dict['accuracy'].update(correct.item(), B)
 
             functional.reset_net(model)
@@ -617,7 +619,7 @@ def main():
                 scheduler_per_epoch.step()
 
         with Timer(' Test', logger):
-            test_loss, test_acc = test_triplet(model, data_loader_test, args.print_freq, logger)
+            test_loss, test_acc = evaluate_triplet(model, data_loader_test, args.print_freq, logger, criterion_eval)
 
             # Only returns loss and accuracy, not test_acc5
 
@@ -705,7 +707,7 @@ def main():
     ##### test #####
 
     if is_main_process():
-        test_triplet(model.cuda(), data_loader_test, args.print_freq, logger)
+        test_triplet(model.cuda(), data_loader_test, args.print_freq, logger, criterion_eval)
     logger.info('All Done.')
 
 
