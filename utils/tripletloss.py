@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 class TripletLoss(nn.Module):
     def __init__(self, margin=0.2):
@@ -37,3 +38,40 @@ class TripletLoss(nn.Module):
         # Mean over all dimensions
         loss = loss.mean()
         return loss
+
+class OnlineTripletLoss(nn.Module):
+    def __init__(self, margin=0.2):
+        super().__init__()
+        self.margin = margin
+
+    def forward(self, embeddings, labels):
+        # embeddings: [B, D]; labels: [B]
+        # 1) pairwise distance
+        dist = torch.cdist(embeddings, embeddings, p=2)              # [B, B]
+
+        loss = 0.0
+        n = 0
+        for i in range(embeddings.size(0)):
+            label_i = labels[i]
+            # positives & negatives masks
+            pos_mask = (labels == label_i)
+            neg_mask = (labels != label_i)
+
+            # hardest positive
+            pos_dists = dist[i][pos_mask]
+            pos_dists = pos_dists[pos_dists > 0]                      # exclude self-distance zero
+            hardest_pos = pos_dists.max()
+
+            # semi-hard negatives: dist > hardest_pos
+            neg_dists = dist[i][neg_mask]
+            semi = neg_dists[neg_dists > hardest_pos]
+            if semi.numel() > 0:
+                hardest_neg = semi.min()
+            else:
+                hardest_neg = neg_dists.min()
+
+            triplet = F.relu(hardest_pos - hardest_neg + self.margin)
+            loss += triplet
+            n += 1
+
+        return loss / n
