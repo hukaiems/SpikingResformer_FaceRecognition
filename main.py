@@ -443,6 +443,19 @@ def evaluate(model, criterion, data_loader, print_freq, logger, one_hot=None):
 def evaluate_triplet(model, data_loader, print_freq, logger):
     model.eval()
     metric_dict = RecordDict({'loss': None, 'accuracy': None})
+    
+    # Fix: Handle case where data_loader is empty or print_freq causes division by zero
+    total_batches = len(data_loader)
+    if total_batches == 0:
+        logger.warning("Empty evaluation data loader")
+        return 0.0, 0.0
+    
+    # Calculate print interval safely
+    if print_freq > 0 and total_batches > 0:
+        print_interval = max(1, total_batches // print_freq)
+    else:
+        print_interval = 0  # No printing
+    
     with torch.no_grad():
         for idx, (anchor, positive, negative) in enumerate(data_loader):
             # Move to GPU
@@ -481,11 +494,11 @@ def evaluate_triplet(model, data_loader, print_freq, logger):
             # reset spiking states
             functional.reset_net(model)
 
-            # Logging
-            if print_freq and ((idx + 1) % int(len(data_loader) / print_freq) == 0):
+            # Logging with safe division
+            if print_interval > 0 and ((idx + 1) % print_interval == 0):
                 metric_dict.sync()
                 logger.debug(
-                    f' [{idx+1}/{len(data_loader)}] '
+                    f' [{idx+1}/{total_batches}] '
                     f'loss: {metric_dict["loss"].ave:.5f}, '
                     f'accuracy: {metric_dict["accuracy"].ave:.5f}'
                 )
@@ -575,6 +588,19 @@ def test_triplet(
 ):
     model.eval()
     metric_dict = RecordDict({'loss': None, 'accuracy': None})
+    
+    # Fix: Handle case where data_loader is empty or print_freq causes division by zero
+    total_batches = len(data_loader_test)
+    if total_batches == 0:
+        logger.warning("Empty test data loader")
+        return 0.0, 0.0
+    
+    # Calculate print interval safely
+    if print_freq > 0 and total_batches > 0:
+        print_interval = max(1, total_batches // print_freq)
+    else:
+        print_interval = 0  # No printing
+    
     with torch.no_grad():
         for idx, (anchor, positive, negative) in enumerate(data_loader_test):
             # Move all to GPU
@@ -607,11 +633,11 @@ def test_triplet(
 
             functional.reset_net(model)
 
-            # Logging
-            if print_freq and ((idx + 1) % int(len(data_loader_test) / print_freq) == 0):
+            # Logging with safe division
+            if print_interval > 0 and ((idx + 1) % print_interval == 0):
                 metric_dict.sync()
                 logger.debug(
-                    f' [{idx+1}/{len(data_loader_test)}] '
+                    f' [{idx+1}/{total_batches}] '
                     f'loss: {metric_dict["loss"].ave:.5f}, '
                     f'accuracy: {metric_dict["accuracy"].ave:.5f}'
                 )
