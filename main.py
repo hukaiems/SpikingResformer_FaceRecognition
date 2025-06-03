@@ -41,6 +41,7 @@ from timm.models import create_model
 from utils.triplet_face import TripletFaceDataset
 from utils.tripletloss import TripletLoss
 
+import math
 
 
 def parse_args():
@@ -108,6 +109,31 @@ def parse_args():
 
     return args
 
+class ArcFaceLoss(nn.Module):
+    def __init__(self, embed_dim, num_classes, s=30.0, m=0.5):
+        super().__init__()
+        self.s = s  # Scale factor
+        self.m = m  # Margin
+        self.weight = nn.Parameter(torch.Tensor(num_classes, embed_dim))
+        nn.init.xavier_uniform_(self.weight)
+        self.cos_m = math.cos(m)
+        self.sin_m = math.sin(m)
+        self.threshold = math.cos(math.pi - m)
+        self.mm = self.sin_m * m
+
+    def forward(self, embeddings, labels):
+        # embeddings: [B, embed_dim], labels: [B]
+        cos_theta = F.linear(F.normalize(embeddings), F.normalize(self.weight))
+        sin_theta = torch.sqrt(1.0 - torch.pow(cos_theta, 2) + 1e-7)
+        cos_theta_m = cos_theta * self.cos_m - sin_theta * self.sin_m
+        
+        # Apply margin only to correct class
+        mask = torch.zeros_like(cos_theta).scatter_(1, labels.unsqueeze(1), 1.0)
+        output = cos_theta * (1.0 - mask) + cos_theta_m * mask
+        output = output * self.s
+        loss = F.cross_entropy(output, labels)
+        return loss
+
 
 def setup_logger(output_dir):
     logger = logging.getLogger(__name__)
@@ -170,274 +196,40 @@ def load_data(
     label_smoothing: float,
     T: int,
     triplet_list_train: str,
-    triplet_list_val:   str,  
+    triplet_list_val: str,
 ):
-
-    if dataset_type == 'CIFAR10':
-        dataset_train = torchvision.datasets.CIFAR10(root=os.path.join(dataset_dir), train=True,
-                                                     download=True)
-        dataset_test = torchvision.datasets.CIFAR10(root=os.path.join(dataset_dir), train=False,
-                                                    download=True)
-        augment_args = dict(
-            scale=[1.0, 1.0],
-            ratio=[1.0, 1.0],
-            hflip=0.5,
-            vflip=0.0,
-        )
-        if augment:
-            augment_args.update(dict(
-                color_jitter=0.0,
-                auto_augment=augment,
-            ))
-        if cutout:
-            augment_args.update(dict(
-                re_prob=0.25,
-                re_mode='const',
-                re_count=1,
-                re_split=False,
-            ))
-        if mixup:
-            augment_args.update(
-                dict(collate_fn=FastCollateMixup(mixup_alpha=0.5, cutmix_alpha=0.0,
-                                                 cutmix_minmax=None, prob=1.0, switch_prob=0.5,
-                                                 mode='batch', label_smoothing=label_smoothing,
-                                                 num_classes=num_classes)))
-        data_loader_train = create_loader(
-            dataset_train,
-            input_size=input_size,
-            batch_size=batch_size,
-            is_training=True,
-            use_prefetcher=True,
-            interpolation='bicubic',
-            mean=(0.4914, 0.4822, 0.4465),
-            std=(0.2023, 0.1994, 0.2010),
-            num_workers=workers,
-            distributed=distributed,
-            pin_memory=True,
-            **augment_args,
-        )
-        data_loader_test = create_loader(
-            dataset_test,
-            input_size=input_size,
-            batch_size=batch_size,
-            is_training=False,
-            use_prefetcher=True,
-            interpolation='bicubic',
-            mean=(0.4914, 0.4822, 0.4465),
-            std=(0.2023, 0.1994, 0.2010),
-            num_workers=workers,
-            distributed=distributed,
-            crop_pct=1.0,
-            pin_memory=True,
-        )
-    elif dataset_type == 'CIFAR100':
-        dataset_train = torchvision.datasets.CIFAR100(root=os.path.join(dataset_dir), train=True,
-                                                      download=True)
-        dataset_test = torchvision.datasets.CIFAR100(root=os.path.join(dataset_dir), train=False,
-                                                     download=True)
-        augment_args = dict(
-            scale=[1.0, 1.0],
-            ratio=[1.0, 1.0],
-            hflip=0.5,
-            vflip=0.0,
-        )
-        if augment:
-            augment_args.update(dict(
-                color_jitter=0.0,
-                auto_augment=augment,
-            ))
-        if cutout:
-            augment_args.update(dict(
-                re_prob=0.25,
-                re_mode='const',
-                re_count=1,
-                re_split=False,
-            ))
-        if mixup:
-            augment_args.update(
-                dict(collate_fn=FastCollateMixup(mixup_alpha=0.5, cutmix_alpha=0.0,
-                                                 cutmix_minmax=None, prob=1.0, switch_prob=0.5,
-                                                 mode='batch', label_smoothing=label_smoothing,
-                                                 num_classes=num_classes)))
-        data_loader_train = create_loader(
-            dataset_train,
-            input_size=input_size,
-            batch_size=batch_size,
-            is_training=True,
-            use_prefetcher=True,
-            interpolation='bicubic',
-            mean=[n / 255. for n in [129.3, 124.1, 112.4]],
-            std=[n / 255. for n in [68.2, 65.4, 70.4]],
-            num_workers=workers,
-            distributed=distributed,
-            pin_memory=True,
-            **augment_args,
-        )
-        data_loader_test = create_loader(
-            dataset_test,
-            input_size=input_size,
-            batch_size=batch_size,
-            is_training=False,
-            use_prefetcher=True,
-            interpolation='bicubic',
-            mean=[n / 255. for n in [129.3, 124.1, 112.4]],
-            std=[n / 255. for n in [68.2, 65.4, 70.4]],
-            num_workers=workers,
-            distributed=distributed,
-            crop_pct=1.0,
-            pin_memory=True,
-        )
-    elif dataset_type == 'CIFAR10DVS':
-        from spikingjelly.datasets.cifar10_dvs import CIFAR10DVS
-        if augment:
-            transform_train = DVStransform(transform=transforms.Compose([
-                transforms.Resize(size=input_size[-2:], antialias=True),
-                DVSAugment()]))
-        else:
-            transform_train = DVStransform(transform=transforms.Compose([
-                transforms.Resize(size=input_size[-2:], antialias=True)]))
-        transform_test = DVStransform(
-            transform=transforms.Resize(size=input_size[-2:], antialias=True))
-
-        dataset = CIFAR10DVS(dataset_dir, data_type='frame', frames_number=T, split_by='number')
-        dataset_train, dataset_test = DatasetSplitter(dataset, 0.9,
-                                                      True), DatasetSplitter(dataset, 0.1, False)
-        dataset_train = DatasetWarpper(dataset_train, transform_train)
-        dataset_test = DatasetWarpper(dataset_test, transform_test)
-        if distributed:
-            train_sampler = torch.utils.data.distributed.DistributedSampler(  # type:ignore
-                dataset_train)
-            test_sampler = torch.utils.data.distributed.DistributedSampler(
-                dataset_test)  # type:ignore
-        else:
-            train_sampler = torch.utils.data.RandomSampler(dataset_train)
-            test_sampler = torch.utils.data.SequentialSampler(dataset_test)
-        data_loader_train = torch.utils.data.DataLoader(dataset_train, batch_size=batch_size,
-                                                        sampler=train_sampler, num_workers=workers,
-                                                        pin_memory=True, drop_last=True)
-
-        data_loader_test = torch.utils.data.DataLoader(dataset_test, batch_size=batch_size,
-                                                       sampler=test_sampler, num_workers=workers,
-                                                       pin_memory=True, drop_last=False)
-    elif dataset_type == 'DVS128Gesture':
-        from spikingjelly.datasets.dvs128_gesture import DVS128Gesture
-        if augment:
-            transform_train = DVStransform(transform=transforms.Compose([
-                transforms.Resize(size=input_size[-2:], antialias=True),
-                DVSAugment()]))
-        else:
-            transform_train = DVStransform(transform=transforms.Compose([
-                transforms.Resize(size=input_size[-2:], antialias=True)]))
-        transform_test = DVStransform(
-            transform=transforms.Resize(size=input_size[-2:], antialias=True))
-
-        dataset_train = DVS128Gesture(dataset_dir, train=True, data_type='frame', frames_number=T,
-                                      split_by='number')
-        dataset_test = DVS128Gesture(dataset_dir, train=False, data_type='frame', frames_number=T,
-                                     split_by='number')
-        dataset_train = DatasetWarpper(dataset_train, transform_train)
-        dataset_test = DatasetWarpper(dataset_test, transform_test)
-        if distributed:
-            train_sampler = torch.utils.data.distributed.DistributedSampler(  # type:ignore
-                dataset_train)
-            test_sampler = torch.utils.data.distributed.DistributedSampler(
-                dataset_test)  # type:ignore
-        else:
-            train_sampler = torch.utils.data.RandomSampler(dataset_train)
-            test_sampler = torch.utils.data.SequentialSampler(dataset_test)
-        data_loader_train = torch.utils.data.DataLoader(dataset_train, batch_size=batch_size,
-                                                        sampler=train_sampler, num_workers=workers,
-                                                        pin_memory=True, drop_last=True)
-
-        data_loader_test = torch.utils.data.DataLoader(dataset_test, batch_size=batch_size,
-                                                       sampler=test_sampler, num_workers=workers,
-                                                       pin_memory=True, drop_last=False)
-    elif dataset_type.lower() == 'tripletface':
-        # common transforms
+    if dataset_type.lower() == 'tripletface':
+        # Common transforms
         transform = transforms.Compose([
             transforms.Resize(input_size[-2:]),
             transforms.CenterCrop(input_size[-2:]),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485,0.456,0.406],
-                                std=[0.229,0.224,0.225]),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
-        # train set
-        train_ds = TripletFaceDataset(triplet_list_train, transform=transform)
+        # Training set with identity labels
+        train_ds = torchvision.datasets.ImageFolder(
+            root=os.path.join(dataset_dir, 'train'),
+            transform=transform
+        )
+        # Validation set remains triplet-based
+        test_ds = TripletFaceDataset(triplet_list_val, transform=transform)
+        
+        if distributed:
+            train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds)
+            test_sampler = torch.utils.data.distributed.DistributedSampler(test_ds)
+        else:
+            train_sampler = torch.utils.data.RandomSampler(train_ds)
+            test_sampler = torch.utils.data.SequentialSampler(test_ds)
+        
         data_loader_train = torch.utils.data.DataLoader(
-            train_ds, batch_size=batch_size,
-            shuffle=True, num_workers=workers,
-            pin_memory=True, drop_last=True,
+            train_ds, batch_size=batch_size, sampler=train_sampler,
+            num_workers=workers, pin_memory=True, drop_last=True,
         )
-        # val/test set
-        val_ds = TripletFaceDataset(triplet_list_val, transform=transform)
         data_loader_test = torch.utils.data.DataLoader(
-            val_ds, batch_size=batch_size,
-            shuffle=False, num_workers=workers,
-            pin_memory=True, drop_last=False,
+            test_ds, batch_size=batch_size, sampler=test_sampler,
+            num_workers=workers, pin_memory=True, drop_last=False,
         )
-        dataset_train, dataset_test = train_ds, val_ds
-
-    elif dataset_type == 'ImageNet' or dataset_type == 'ImageNet100':
-        traindir = os.path.join(dataset_dir, 'train')
-        valdir = os.path.join(dataset_dir, 'val')
-        dataset_train = torchvision.datasets.ImageFolder(traindir)
-        dataset_test = torchvision.datasets.ImageFolder(valdir)
-        augment_args = dict(
-            scale=[0.08, 1.0],
-            ratio=[3. / 4., 4. / 3.],
-            hflip=0.5,
-            vflip=0.0,
-        )
-        if augment:
-            augment_args.update(dict(
-                color_jitter=0.4,
-                auto_augment=augment,
-            ))
-        if cutout:
-            augment_args.update(dict(
-                re_prob=0.25,
-                re_mode='const',
-                re_count=1,
-                re_split=False,
-            ))
-        if mixup:
-            augment_args.update(
-                dict(collate_fn=FastCollateMixup(mixup_alpha=0.2, cutmix_alpha=1.0,
-                                                 cutmix_minmax=None, prob=1.0, switch_prob=0.5,
-                                                 mode='batch', label_smoothing=label_smoothing,
-                                                 num_classes=num_classes)))
-        data_loader_train = create_loader(
-            dataset_train,
-            input_size=input_size,
-            batch_size=batch_size,
-            is_training=True,
-            use_prefetcher=True,
-            interpolation='bicubic',
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225],
-            num_workers=workers,
-            distributed=distributed,
-            pin_memory=True,
-            **augment_args,
-        )
-        data_loader_test = create_loader(
-            dataset_test,
-            input_size=input_size,
-            batch_size=batch_size,
-            is_training=False,
-            use_prefetcher=True,
-            interpolation='bicubic',
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225],
-            num_workers=workers,
-            distributed=distributed,
-            crop_pct=0.95,
-            pin_memory=True,
-        )
-    else:
-        raise ValueError(dataset_type)
-
-    return dataset_train, dataset_test, data_loader_train, data_loader_test
+        return train_ds, test_ds, data_loader_train, data_loader_test
 
 
 def train_one_epoch(
@@ -450,64 +242,51 @@ def train_one_epoch(
     factor: int,
     scheduler_per_iter: Optional[BaseSchedulerPerIter] = None,
     scaler: Optional[GradScaler] = None,
-    one_hot: Optional[int] = None,
 ):
     model.train()
-    metric_dict = RecordDict({'loss': None, 'acc@1': None, 'acc@5': None})
+    metric_dict = RecordDict({'loss': None})
     timer_container = [0.0]
-
     model.zero_grad()
-    for idx, (image, target) in enumerate(data_loader_train):
+    
+    for idx, (images, labels) in enumerate(data_loader_train):
         with GlobalTimer('iter', timer_container):
-            image, target = image.cuda(), target.cuda()
-            if one_hot:
-                target = F.one_hot(target, one_hot).float()
+            images, labels = images.cuda(), labels.cuda()
             if scaler is not None:
                 with autocast():
-                    output = model(image)
-                    loss = criterion(output, target)
+                    embeddings = model(images).mean(0)  # [B, embed_dim]
+                    loss = criterion(embeddings, labels)
             else:
-                output = model(image)
-                loss = criterion(output, target)
+                embeddings = model(images).mean(0)
+                loss = criterion(embeddings, labels)
+            
             metric_dict['loss'].update(loss.item())
-
+            
             if scaler is not None:
-                scaler.scale(loss).backward()  # type:ignore
+                scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
                 model.zero_grad()
-
             else:
                 loss.backward()
                 optimizer.step()
                 model.zero_grad()
-
+            
             if scheduler_per_iter is not None:
                 scheduler_per_iter.step()
-
+            
             functional.reset_net(model)
-
-            if target.dim() > 1:
-                target = target.argmax(-1)
-            acc1, acc5 = accuracy(output.mean(0), target, topk=(1, 5))
-            acc1_s = acc1.item()
-            acc5_s = acc5.item()
-
-            batch_size = image.shape[0]
-            metric_dict['acc@1'].update(acc1_s, batch_size)
-            metric_dict['acc@5'].update(acc5_s, batch_size)
-
-        if print_freq != 0 and ((idx + 1) % int(len(data_loader_train) / (print_freq))) == 0:
-            #torch.distributed.barrier()
+        
+        batch_size = images.size(0)
+        if print_freq and ((idx + 1) % int(len(data_loader_train) / print_freq) == 0):
             metric_dict.sync()
-            logger.debug(' [{}/{}] it/s: {:.5f}, loss: {:.5f}, acc@1: {:.5f}, acc@5: {:.5f}'.format(
-                idx + 1, len(data_loader_train),
-                (idx + 1) * batch_size * factor / timer_container[0], metric_dict['loss'].ave,
-                metric_dict['acc@1'].ave, metric_dict['acc@5'].ave))
-
-    #torch.distributed.barrier()
+            logger.debug(
+                f' [{idx+1}/{len(data_loader_train)}] it/s: '
+                f'{(idx+1)*batch_size*factor/timer_container[0]:.5f}, '
+                f'loss: {metric_dict["loss"].ave:.5f}'
+            )
+    
     metric_dict.sync()
-    return metric_dict['loss'].ave, metric_dict['acc@1'].ave, metric_dict['acc@5'].ave
+    return metric_dict['loss'].ave
 
 def train_one_epoch_triplet(
     model, criterion, optimizer,
@@ -786,7 +565,6 @@ def test_triplet(
 
 
 def main():
-
     ##################################################
     #                       setup
     ##################################################
@@ -808,32 +586,15 @@ def main():
     logger.info(str(args))
 
     # load data
-
     dataset_type = args.dataset
     one_hot = None
     if dataset_type == 'CIFAR10':
         num_classes = 10
         input_size = (3, 32, 32)
-    elif dataset_type == 'CIFAR10DVS':
-        one_hot = 10
-        num_classes = 10
-        input_size = (3, 64, 64)
-    elif dataset_type == 'DVS128Gesture':
-        one_hot = 11
-        num_classes = 11
-        input_size = (3, 64, 64)
-    elif dataset_type == 'CIFAR100':
-        num_classes = 100
-        input_size = (3, 32, 32)
-    elif dataset_type == 'ImageNet':
-        num_classes = 1000
-        input_size = (3, 224, 224)
-    elif dataset_type == 'ImageNet100':
-        num_classes = 100
-        input_size = (3, 224, 224)
+    # ... (other dataset types)
     elif dataset_type.lower() == 'tripletface':
-        num_classes = 512  # Use 512 for embedding dimension
-        input_size = (3, 224, 224)  # Standard size for face images
+        input_size = (3, 224, 224)
+        embed_dim = 512  # Embedding dimension
     else:
         raise ValueError(dataset_type)
     if len(args.input_size) != 0:
@@ -841,25 +602,29 @@ def main():
 
     dataset_train, dataset_test, data_loader_train, data_loader_test = load_data(
         args.data_path, args.batch_size, args.workers, num_classes, dataset_type, input_size,
-        distributed, args.augment, args.mixup, args.cutout, args.label_smoothing, args.T, args.triplet_list_train, args.triplet_list_val)
+        distributed, args.augment, args.mixup, args.cutout, args.label_smoothing, args.T,
+        args.triplet_list_train, args.triplet_list_val)
+    
+    # Set num_classes for tripletface after loading dataset
+    if dataset_type.lower() == 'tripletface':
+        num_classes = len(dataset_train.classes)  # Number of identities
+    
     logger.info('dataset_train: {}, dataset_test: {}'.format(len(dataset_train), len(dataset_test)))
 
-    # model
-
+    # Model
     model = create_model(
         args.model,
         T=args.T,
-        num_classes=num_classes,
+        num_classes=embed_dim,  # Output embeddings, not logits
         img_size=input_size[-1],
     ).cuda()
 
-    # transfer
+    # Transfer
     if args.transfer:
         checkpoint = torch.load(args.transfer, map_location='cpu')
         model.transfer(checkpoint['model'])
 
-    # optimzer
-
+    # Optimizer
     optimizer = create_optimizer_v2(
         model,
         opt=args.optimizer,
@@ -867,25 +632,26 @@ def main():
         weight_decay=args.weight_decay,
     )
 
-    # loss_fn
-
-    margin = 0.2  # You can make this configurable through args
-    criterion = TripletLoss(margin=margin)
-    criterion_eval = TripletLoss(margin=margin)  # Same loss for evaluation
-
+    # Loss function
+    if dataset_type.lower() == 'tripletface':
+        criterion = ArcFaceLoss(embed_dim=embed_dim, num_classes=num_classes)
+        criterion_eval = TripletLoss(margin=0.2)  # For triplet-based evaluation
+    else:
+        margin = 0.2
+        criterion = TripletLoss(margin=margin)
+        criterion_eval = TripletLoss(margin=margin)
+    
     if args.TET:
         criterion = CriterionWarpper(criterion, args.TET, args.TET_phi, args.TET_lambda)
         criterion_eval = CriterionWarpper(criterion_eval)
 
-    # amp speed up
-
+    # AMP speed up
     if args.amp:
         scaler = GradScaler()
     else:
         scaler = None
 
-    # lr scheduler
-
+    # LR scheduler
     lr_scheduler, _ = create_scheduler_v2(
         optimizer,
         sched='cosine',
@@ -901,20 +667,17 @@ def main():
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
     # DDP
-
     model_without_ddp = model
     if distributed and not args.test_only:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank],
-                                                          find_unused_parameters=False)
+                                                         find_unused_parameters=False)
         model_without_ddp = model.module
 
-    # custom scheduler
-
+    # Custom scheduler
     scheduler_per_iter = None
     scheduler_per_epoch = None
 
-    # resume
-
+    # Resume
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu')
         model_without_ddp.load_state_dict(checkpoint['model'])
@@ -925,7 +688,6 @@ def main():
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
         logger.info('Resume from epoch {}'.format(start_epoch))
         start_epoch += 1
-        # custom scheduler
     else:
         start_epoch = 0
         max_acc1 = 0
@@ -959,10 +721,11 @@ def main():
         logger.info('Epoch [{}] Start, lr {:.6f}'.format(epoch, optimizer.param_groups[0]["lr"]))
 
         with Timer(' Train', logger):
-            train_loss = train_one_epoch_triplet(model, criterion, optimizer,
-                                                                 data_loader_train, logger,
-                                                                 args.print_freq, world_size,
-                                                                 scheduler_per_iter, scaler)
+            # Use train_one_epoch for ArcFace-based training
+            train_loss = train_one_epoch(model, criterion, optimizer,
+                                         data_loader_train, logger,
+                                         args.print_freq, world_size,
+                                         scheduler_per_iter, scaler)
             if lr_scheduler is not None:
                 lr_scheduler.step(epoch + 1)
             if scheduler_per_epoch is not None:
@@ -971,11 +734,8 @@ def main():
         with Timer(' Test', logger):
             test_loss, test_acc = test_triplet(model, data_loader_test, args.print_freq, logger)
 
-            # Only returns loss and accuracy, not test_acc5
-
         if is_main_process() and tb_writer is not None:
-            tb_record_triplet(tb_writer, train_loss, test_loss, test_acc,
-                      epoch)
+            tb_record_triplet(tb_writer, train_loss, test_loss, test_acc, epoch)
 
         logger.info(' Test loss: {:.5f}, Accuracy: {:.5f}'.format(test_loss, test_acc))
 
@@ -983,12 +743,12 @@ def main():
             'model': model_without_ddp.state_dict(),
             'optimizer': optimizer.state_dict(),
             'epoch': epoch,
-            'max_acc1': max_acc1, }
+            'max_acc1': max_acc1,
+        }
         if lr_scheduler is not None:
             checkpoint['lr_scheduler'] = lr_scheduler.state_dict()
-        # custom scheduler
-        
-         # --- save “best” checkpoint ---
+
+        # Save best checkpoint
         if test_acc > max_acc1:
             max_acc1 = test_acc
             best_ckpt = {
@@ -1004,7 +764,7 @@ def main():
                 os.path.join(args.output_dir, 'checkpoint_max_acc1.pth')
             )
 
-        # optional: also save the latest
+        # Optional: save latest checkpoint
         if args.save_latest:
             latest_ckpt = {
                 'model': model_without_ddp.state_dict(),
@@ -1018,22 +778,20 @@ def main():
                 latest_ckpt,
                 os.path.join(args.output_dir, 'checkpoint_latest.pth')
             )
-            logger.info('Training completed.')
+
+    logger.info('Training completed.')
 
     ##################################################
     #                   test
     ##################################################
 
-    ##### reset utils #####
-
-    # reset model
-
+    # Reset model
     del model, model_without_ddp
 
     model = create_model(
         args.model,
         T=args.T,
-        num_classes=512,
+        num_classes=embed_dim,
         img_size=input_size[-1],
     )
 
@@ -1046,16 +804,14 @@ def main():
         logger.warning('Exit.')
         return
 
-    # reload data
-
+    # Reload data
     del dataset_train, dataset_test, data_loader_train, data_loader_test
     _, _, _, data_loader_test = load_data(args.data_path, args.batch_size, args.workers,
                                           num_classes, dataset_type, input_size, False,
                                           args.augment, args.mixup, args.cutout,
                                           args.label_smoothing, args.T, args.triplet_list_train, args.triplet_list_val)
 
-    ##### test #####
-
+    # Test
     if is_main_process():
         test_triplet(model.cuda(), data_loader_test, args.print_freq, logger)
     logger.info('All Done.')
