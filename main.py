@@ -1,6 +1,9 @@
 import torch.multiprocessing as mp
 mp.set_start_method('spawn', force=True)
 
+import torch
+torch.cuda.init()  # Explicitly initialize CUDA context once
+
 import os
 import time
 import yaml
@@ -8,7 +11,6 @@ import random
 import logging
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-import torch
 from torch import nn
 import torch.utils.data
 import torch.nn.functional as F
@@ -161,6 +163,7 @@ def parse_args():
     parser.add_argument('--amp', type=bool, default=True, help='Use AMP training')
     parser.add_argument('--sync-bn', action='store_true', help='Use SyncBN training')
     parser.add_argument('--use-online-mining', action='store_true', help='Use online hard mining')
+    parser.add_argument('--distributed-init-mode', type=str, default='env://', choices=['env://', 'none'])
 
     args_config, remaining = config_parser.parse_known_args()
     if args_config.config:
@@ -186,6 +189,9 @@ def setup_logger(output_dir):
     return logger
 
 def init_distributed(logger: logging.Logger, distributed_init_mode):
+    if distributed_init_mode == 'none':
+        logger.info('Distributed mode disabled')
+        return False, 0, 1, 0
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         rank = int(os.environ["RANK"])
         world_size = int(os.environ['WORLD_SIZE'])
