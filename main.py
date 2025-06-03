@@ -252,7 +252,10 @@ def train_one_epoch(
             images, labels = images.cuda(), labels.cuda()
             if scaler is not None:
                 with autocast():
-                    embeddings = model(images).mean(0)  # [B, embed_dim]
+                    embeddings = model(images)  # Debug: Check raw output
+                    print(f"Raw embeddings shape: {embeddings.shape}")
+                    embeddings = embeddings.mean(0)  # [B, embed_dim]
+                    print(f"Mean embeddings shape: {embeddings.shape}")
                     loss = criterion(embeddings, labels)
             else:
                 embeddings = model(images).mean(0)
