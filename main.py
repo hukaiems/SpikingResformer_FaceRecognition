@@ -114,6 +114,8 @@ class ArcFaceLoss(nn.Module):
         super().__init__()
         self.s = s  # Scale factor
         self.m = m  # Margin
+        self.embed_dim = embed_dim
+        self.num_classes = num_classes
         self.weight = nn.Parameter(torch.Tensor(num_classes, embed_dim))
         nn.init.xavier_uniform_(self.weight)
         self.cos_m = math.cos(m)
@@ -122,15 +124,41 @@ class ArcFaceLoss(nn.Module):
         self.mm = self.sin_m * m
 
     def forward(self, embeddings, labels):
-        # embeddings: [B, embed_dim], labels: [B]
-        cos_theta = F.linear(F.normalize(embeddings), F.normalize(self.weight))
+        # Handle different input shapes
+        if embeddings.dim() == 3:  # [T, B, embed_dim] - from TET
+            # Take mean across time steps
+            embeddings = embeddings.mean(0)  # [B, embed_dim]
+        elif embeddings.dim() == 2:  # [B, embed_dim] - normal case
+            pass
+        else:
+            raise ValueError(f"Unexpected embeddings shape: {embeddings.shape}")
+        
+        # Debug prints
+        print(f"ArcFace input embeddings shape: {embeddings.shape}")
+        print(f"ArcFace labels shape: {labels.shape}")
+        print(f"Weight shape: {self.weight.shape}")
+        
+        # Normalize embeddings and weights
+        embeddings_norm = F.normalize(embeddings, p=2, dim=1)  # [B, embed_dim]
+        weight_norm = F.normalize(self.weight, p=2, dim=1)     # [num_classes, embed_dim]
+        
+        # Compute cosine similarity
+        cos_theta = F.linear(embeddings_norm, weight_norm)  # [B, num_classes]
+        
+        # Compute sin_theta
         sin_theta = torch.sqrt(1.0 - torch.pow(cos_theta, 2) + 1e-7)
+        
+        # Apply margin
         cos_theta_m = cos_theta * self.cos_m - sin_theta * self.sin_m
         
-        # Apply margin only to correct class
+        # Create mask for target classes
         mask = torch.zeros_like(cos_theta).scatter_(1, labels.unsqueeze(1), 1.0)
+        
+        # Apply margin only to correct class
         output = cos_theta * (1.0 - mask) + cos_theta_m * mask
         output = output * self.s
+        
+        # Compute cross entropy loss
         loss = F.cross_entropy(output, labels)
         return loss
 
@@ -174,12 +202,36 @@ def init_distributed(logger: logging.Logger, distributed_init_mode):
     return True, rank, world_size, local_rank
 
 
-def _get_cache_path(filepath):
-    import hashlib
-    h = hashlib.sha1(filepath.encode()).hexdigest()
-    cache_path = os.path.join("~", ".torch", "vision", "datasets", "imagefolder", h[:10] + ".pt")
-    cache_path = os.path.expanduser(cache_path)
-    return cache_path
+class TETArcFaceLoss(nn.Module):
+    """TET-aware ArcFace loss that handles temporal outputs properly"""
+    def __init__(self, embed_dim, num_classes, s=30.0, m=0.5, TET_phi=1.0, TET_lambda=0.0):
+        super().__init__()
+        self.arcface = ArcFaceLoss(embed_dim, num_classes, s, m)
+        self.TET_phi = TET_phi
+        self.TET_lambda = TET_lambda
+        
+    def forward(self, embeddings, labels):
+        if embeddings.dim() == 3:  # [T, B, embed_dim]
+            T, B, D = embeddings.shape
+            total_loss = 0.0
+            
+            # Apply ArcFace loss at each time step
+            for t in range(T):
+                step_loss = self.arcface(embeddings[t], labels)  # [B, embed_dim]
+                total_loss += (1.0 - self.TET_lambda) * step_loss
+            
+            # Add TET regularization if needed
+            if self.TET_phi > 0:
+                # Mean squared error between consecutive time steps
+                mse_loss = 0.0
+                for t in range(1, T):
+                    mse_loss += F.mse_loss(embeddings[t], embeddings[t-1])
+                total_loss += self.TET_phi * self.TET_lambda * mse_loss / (T - 1)
+            
+            return total_loss / T
+        else:
+            # Standard case
+            return self.arcface(embeddings, labels)
 
 
 def load_data(
@@ -250,15 +302,17 @@ def train_one_epoch(
     for idx, (images, labels) in enumerate(data_loader_train):
         with GlobalTimer('iter', timer_container):
             images, labels = images.cuda(), labels.cuda()
+            
             if scaler is not None:
                 with autocast():
-                    embeddings = model(images)  # Debug: Check raw output
+                    embeddings = model(images)  # Shape: [T, B, embed_dim] or [B, embed_dim]
                     print(f"Raw embeddings shape: {embeddings.shape}")
-                    embeddings = embeddings.mean(0)  # [B, embed_dim]
-                    print(f"Mean embeddings shape: {embeddings.shape}")
+                    
+                    # Let ArcFace handle the dimension reduction
                     loss = criterion(embeddings, labels)
             else:
-                embeddings = model(images).mean(0)
+                embeddings = model(images)
+                print(f"Raw embeddings shape: {embeddings.shape}")
                 loss = criterion(embeddings, labels)
             
             metric_dict['loss'].update(loss.item())
@@ -641,16 +695,27 @@ def main():
 
     # Loss function
     if dataset_type.lower() == 'tripletface':
-        criterion = ArcFaceLoss(embed_dim=embed_dim, num_classes=num_classes)
+        if args.TET:
+            # Use TET-aware ArcFace loss
+            criterion = TETArcFaceLoss(
+                embed_dim=embed_dim, 
+                num_classes=num_classes,
+                TET_phi=args.TET_phi,
+                TET_lambda=args.TET_lambda
+            )
+        else:
+            # Use standard ArcFace loss
+            criterion = ArcFaceLoss(embed_dim=embed_dim, num_classes=num_classes)
+        
         criterion_eval = TripletLoss(margin=0.2)  # For triplet-based evaluation
     else:
         margin = 0.2
         criterion = TripletLoss(margin=margin)
         criterion_eval = TripletLoss(margin=margin)
     
-    if args.TET:
-        criterion = CriterionWarpper(criterion, args.TET, args.TET_phi, args.TET_lambda)
-        criterion_eval = CriterionWarpper(criterion_eval)
+    # if args.TET:
+    #     criterion = CriterionWarpper(criterion, args.TET, args.TET_phi, args.TET_lambda)
+    #     criterion_eval = CriterionWarpper(criterion_eval)
 
     # AMP speed up
     if args.amp:
@@ -813,10 +878,13 @@ def main():
 
     # Reload data
     del dataset_train, dataset_test, data_loader_train, data_loader_test
-    _, _, _, data_loader_test = load_data(args.data_path, args.batch_size, args.workers,
-                                          num_classes, dataset_type, input_size, False,
-                                          args.augment, args.mixup, args.cutout,
-                                          args.label_smoothing, args.T, args.triplet_list_train, args.triplet_list_val)
+    _, _, _, data_loader_test = load_data(
+        args.data_path, args.batch_size, args.workers,
+        dataset_type, input_size, False,  # Removed num_classes
+        args.augment, args.mixup, args.cutout,
+        args.label_smoothing, args.T, 
+        args.triplet_list_train, args.triplet_list_val
+    )
 
     # Test
     if is_main_process():
