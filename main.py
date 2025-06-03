@@ -133,10 +133,10 @@ class ArcFaceLoss(nn.Module):
         else:
             raise ValueError(f"Unexpected embeddings shape: {embeddings.shape}")
         
-        # Debug prints
-        print(f"ArcFace input embeddings shape: {embeddings.shape}")
-        print(f"ArcFace labels shape: {labels.shape}")
-        print(f"Weight shape: {self.weight.shape}")
+        # # Debug prints
+        # print(f"ArcFace input embeddings shape: {embeddings.shape}")
+        # print(f"ArcFace labels shape: {labels.shape}")
+        # print(f"Weight shape: {self.weight.shape}")
         
         # Normalize embeddings and weights
         embeddings_norm = F.normalize(embeddings, p=2, dim=1)  # [B, embed_dim]
