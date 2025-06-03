@@ -9,7 +9,6 @@ import datetime
 from torch import Tensor, nn
 from math import nan
 from torch.utils.tensorboard.writer import SummaryWriter
-from utils.tripletloss import TripletLoss
 
 import sys
 
@@ -229,16 +228,11 @@ class CriterionWarpper(nn.Module):
         self.TET_lambda = TET_lambda
         self.mse = nn.MSELoss()
 
-    def forward(self, output: torch.Tensor, target: torch.Tensor = None):
+    def forward(self, output: torch.Tensor, target: torch.Tensor):
         if self.TET:
             loss = 0
             for t in range(output.shape[0]):
-                # Check if criterion is TripletLoss (or similar loss without target)
-                if isinstance(self.criterion, TripletLoss):
-                    t_loss = self.criterion(output[t])
-                else:
-                    t_loss = self.criterion(output[t], target)
-                loss = loss + (1. - self.TET_lambda) * t_loss
+                loss = loss + (1. - self.TET_lambda) * self.criterion(output[t], target)
             loss = loss / output.shape[0]
             if self.TET_lambda != 0:
                 loss = loss + self.TET_lambda * self.mse(
@@ -246,11 +240,7 @@ class CriterionWarpper(nn.Module):
                     torch.zeros_like(output).fill_(self.TET_phi))
             return loss
         else:
-            # Non-TET case
-            if isinstance(self.criterion, TripletLoss):
-                return self.criterion(output.mean(0))
-            else:
-                return self.criterion(output.mean(0), target)
+            return self.criterion(output.mean(0), target)
 
 
 class DatasetWarpper(torch.utils.data.Dataset):
