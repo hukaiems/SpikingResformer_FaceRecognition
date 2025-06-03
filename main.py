@@ -207,7 +207,7 @@ def load_data(
         ])
         # Training set with identity labels
         train_ds = torchvision.datasets.ImageFolder(
-            root=os.path.join(dataset_dir, 'miniTrain'),  # Update to miniTrain
+            root=dataset_dir,
             transform=transform
         )
         # Validation set remains triplet-based
