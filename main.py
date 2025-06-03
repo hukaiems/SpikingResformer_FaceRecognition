@@ -306,13 +306,13 @@ def train_one_epoch(
             if scaler is not None:
                 with autocast():
                     embeddings = model(images)  # Shape: [T, B, embed_dim] or [B, embed_dim]
-                    print(f"Raw embeddings shape: {embeddings.shape}")
+                    # print(f"Raw embeddings shape: {embeddings.shape}")
                     
                     # Let ArcFace handle the dimension reduction
                     loss = criterion(embeddings, labels)
             else:
                 embeddings = model(images)
-                print(f"Raw embeddings shape: {embeddings.shape}")
+                # print(f"Raw embeddings shape: {embeddings.shape}")
                 loss = criterion(embeddings, labels)
             
             metric_dict['loss'].update(loss.item())
