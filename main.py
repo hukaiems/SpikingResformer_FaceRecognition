@@ -695,27 +695,16 @@ def main():
 
     # Loss function
     if dataset_type.lower() == 'tripletface':
-        if args.TET:
-            # Use TET-aware ArcFace loss
-            criterion = TETArcFaceLoss(
-                embed_dim=embed_dim, 
-                num_classes=num_classes,
-                TET_phi=args.TET_phi,
-                TET_lambda=args.TET_lambda
-            )
-        else:
-            # Use standard ArcFace loss
-            criterion = ArcFaceLoss(embed_dim=embed_dim, num_classes=num_classes)
-        
-        criterion_eval = TripletLoss(margin=0.2)  # For triplet-based evaluation
+        criterion = ArcFaceLoss(embed_dim=embed_dim, num_classes=num_classes).cuda()  # <- Add .cuda()
+        criterion_eval = TripletLoss(margin=0.2)
     else:
         margin = 0.2
         criterion = TripletLoss(margin=margin)
         criterion_eval = TripletLoss(margin=margin)
-    
-    # if args.TET:
-    #     criterion = CriterionWarpper(criterion, args.TET, args.TET_phi, args.TET_lambda)
-    #     criterion_eval = CriterionWarpper(criterion_eval)
+
+    if args.TET:
+        criterion = CriterionWarpper(criterion, args.TET, args.TET_phi, args.TET_lambda)
+        criterion_eval = CriterionWarpper(criterion_eval)
 
     # AMP speed up
     if args.amp:
