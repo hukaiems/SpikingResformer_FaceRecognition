@@ -129,9 +129,16 @@ class PKSampler(torch.utils.data.Sampler):
 
 def parse_args():
     config_parser = argparse.ArgumentParser(description="Training Config", add_help=False)
-    config_parser.add_argument("-c", "--config", type=str, metavar="FILE", help="YAML config file")
+    config_parser.add_argument(
+        "-c",
+        "--config",
+        type=str,
+        metavar="FILE",
+        help="YAML config file specifying default arguments",
+    )
+
     parser = argparse.ArgumentParser(description='Training')
-    
+    # Training options
     parser.add_argument('--seed', default=12450, type=int)
     parser.add_argument('--epochs', default=320, type=int)
     parser.add_argument('--batch-size', default=32, type=int)
@@ -151,7 +158,7 @@ def parse_args():
     parser.add_argument('--resume', type=str, help='resume from checkpoint')
     parser.add_argument('--transfer', type=str, help='transfer from pretrained checkpoint')
     parser.add_argument('--input-size', type=int, nargs='+', default=[3, 112, 112])
-    parser.add_argument('--distributed-init-mode', type=str, default='env://')
+    parser.add_argument('--distributed-init-mode', type=str, default='env://', choices=['env://', 'none'])
     parser.add_argument('--dataset', default='imagenet', type=str, help='Dataset name')
     parser.add_argument('--triplet-list-train', type=str, default='', help='Training triplet list')
     parser.add_argument('--triplet-list-val', type=str, default='', help='Validation triplet list')
@@ -159,16 +166,17 @@ def parse_args():
     parser.add_argument('--TET-phi', type=float, default=1.0)
     parser.add_argument('--TET-lambda', type=float, default=0.0)
     parser.add_argument('--save-latest', action='store_true')
-    parser.add_argument("--test-only", action="store_true", help="Only test the model")
+    parser.add_argument('--test-only', action='store_true', help='Only test the model')
     parser.add_argument('--amp', type=bool, default=True, help='Use AMP training')
     parser.add_argument('--sync-bn', action='store_true', help='Use SyncBN training')
     parser.add_argument('--use-online-mining', action='store_true', help='Use online hard mining')
-    parser.add_argument('--distributed-init-mode', type=str, default='env://', choices=['env://', 'none'])
 
     args_config, remaining = config_parser.parse_known_args()
     if args_config.config:
         with open(args_config.config, 'r') as f:
             cfg = yaml.safe_load(f)
+            # Ensure --distributed-init-mode is not overridden by config
+            cfg.pop('distributed-init-mode', None)
         parser.set_defaults(**cfg)
     args = parser.parse_args(remaining)
     return args
