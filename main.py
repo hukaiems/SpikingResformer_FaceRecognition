@@ -186,7 +186,6 @@ def load_data(
     dataset_dir: str,
     batch_size: int,
     workers: int,
-    num_classes: int,
     dataset_type: str,
     input_size: Tuple[int],
     distributed: bool,
@@ -208,7 +207,7 @@ def load_data(
         ])
         # Training set with identity labels
         train_ds = torchvision.datasets.ImageFolder(
-            root=os.path.join(dataset_dir, 'train'),
+            root=os.path.join(dataset_dir, 'miniTrain'),  # Update to miniTrain
             transform=transform
         )
         # Validation set remains triplet-based
@@ -589,7 +588,6 @@ def main():
     dataset_type = args.dataset
     one_hot = None
     if dataset_type == 'CIFAR10':
-        num_classes = 10
         input_size = (3, 32, 32)
     # ... (other dataset types)
     elif dataset_type.lower() == 'tripletface':
@@ -600,15 +598,21 @@ def main():
     if len(args.input_size) != 0:
         input_size = args.input_size
 
+    # Call load_data without num_classes
     dataset_train, dataset_test, data_loader_train, data_loader_test = load_data(
-        args.data_path, args.batch_size, args.workers, num_classes, dataset_type, input_size,
+        args.data_path, args.batch_size, args.workers, dataset_type, input_size,
         distributed, args.augment, args.mixup, args.cutout, args.label_smoothing, args.T,
         args.triplet_list_train, args.triplet_list_val)
-    
+
     # Set num_classes for tripletface after loading dataset
+    num_classes = None  # Default
     if dataset_type.lower() == 'tripletface':
         num_classes = len(dataset_train.classes)  # Number of identities
-    
+    elif dataset_type == 'CIFAR10':
+        num_classes = 10
+    else:
+        raise ValueError(f"num_classes not set for dataset_type {dataset_type}")
+
     logger.info('dataset_train: {}, dataset_test: {}'.format(len(dataset_train), len(dataset_test)))
 
     # Model
