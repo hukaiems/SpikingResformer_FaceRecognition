@@ -1,0 +1,9 @@
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.21.0
+pyyaml>=5.4.0
+argparse>=1.1
+spikingjelly>=0.0.0.0.14
+timm>=0.6.0
+thop>=0.1.1
+tensorboard>=2.8.0
