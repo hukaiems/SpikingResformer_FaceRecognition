@@ -100,6 +100,10 @@ def parse_args():
     parser.add_argument('--amp', type=bool, default=True, help='Use AMP training')
     parser.add_argument('--sync-bn', action='store_true', help='Use SyncBN training')
 
+    # argumet for Arcfaceloss
+    parser.add_argument('--arcface-s', type=float, default=30.0, help='ArcFace scale factor')
+    parser.add_argument('--arcface-m', type=float, default=0.5, help='ArcFace margin')
+
     args_config, remaining = config_parser.parse_known_args()
     if args_config.config:
         with open(args_config.config, 'r') as f:
@@ -249,14 +253,15 @@ def load_data(
     triplet_list_train: str,
     triplet_list_val: str,
 ):
+    # Define common transforms for all datasets
+    transform = transforms.Compose([
+        transforms.Resize(input_size[-2:]),
+        transforms.CenterCrop(input_size[-2:]),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
     if dataset_type.lower() == 'tripletface':
-        # Common transforms
-        transform = transforms.Compose([
-            transforms.Resize(input_size[-2:]),
-            transforms.CenterCrop(input_size[-2:]),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
         # Training set with identity labels
         train_ds = torchvision.datasets.ImageFolder(
             root=dataset_dir,
@@ -264,23 +269,50 @@ def load_data(
         )
         # Validation set remains triplet-based
         test_ds = TripletFaceDataset(triplet_list_val, transform=transform)
-        
-        if distributed:
-            train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds)
-            test_sampler = torch.utils.data.distributed.DistributedSampler(test_ds)
-        else:
-            train_sampler = torch.utils.data.RandomSampler(train_ds)
-            test_sampler = torch.utils.data.SequentialSampler(test_ds)
-        
-        data_loader_train = torch.utils.data.DataLoader(
-            train_ds, batch_size=batch_size, sampler=train_sampler,
-            num_workers=workers, pin_memory=True, drop_last=True,
+    elif dataset_type.lower() == 'cifar10':
+        # CIFAR10 dataset
+        train_ds = torchvision.datasets.CIFAR10(
+            root=dataset_dir,
+            train=True,
+            download=True,
+            transform=transform
         )
-        data_loader_test = torch.utils.data.DataLoader(
-            test_ds, batch_size=batch_size, sampler=test_sampler,
-            num_workers=workers, pin_memory=True, drop_last=False,
+        test_ds = torchvision.datasets.CIFAR10(
+            root=dataset_dir,
+            train=False,
+            download=True,
+            transform=transform
         )
-        return train_ds, test_ds, data_loader_train, data_loader_test
+    else:
+        raise ValueError(f"Unsupported dataset type: {dataset_type}")
+
+    # Set up samplers for distributed training
+    if distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds)
+        test_sampler = torch.utils.data.distributed.DistributedSampler(test_ds)
+    else:
+        train_sampler = torch.utils.data.RandomSampler(train_ds)
+        test_sampler = torch.utils.data.SequentialSampler(test_ds)
+
+    # Create data loaders
+    data_loader_train = torch.utils.data.DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        sampler=train_sampler,
+        num_workers=workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+    data_loader_test = torch.utils.data.DataLoader(
+        test_ds,
+        batch_size=batch_size,
+        sampler=test_sampler,
+        num_workers=workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+
+    return train_ds, test_ds, data_loader_train, data_loader_test
 
 
 def train_one_epoch(
@@ -652,6 +684,8 @@ def main():
     ##################################################
 
     args = parse_args()
+    dataset_type = args.dataset
+    embed_dim = 512 if dataset_type.lower() == 'tripletface' else 10  # Use num_classes for CIFAR10
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -660,6 +694,7 @@ def main():
     torch.backends.cudnn.deterministic = True  # type: ignore
     torch.backends.cudnn.benchmark = False  # type: ignore
 
+    args.output_dir = os.path.join(args.output_dir, f'arcface_s{args.arcface_s}_m{args.arcface_m}')
     safe_makedirs(args.output_dir)
     logger = setup_logger(args.output_dir)
 
@@ -667,34 +702,23 @@ def main():
 
     logger.info(str(args))
 
-    # load data
-    dataset_type = args.dataset
-    one_hot = None
-    if dataset_type == 'CIFAR10':
-        input_size = (3, 32, 32)
-    # ... (other dataset types)
-    elif dataset_type.lower() == 'tripletface':
-        input_size = (3, 224, 224)
-        embed_dim = 512  # Embedding dimension
-    else:
-        raise ValueError(dataset_type)
-    if len(args.input_size) != 0:
-        input_size = args.input_size
+    # Set default input_size if not provided
+    input_size = args.input_size if len(args.input_size) != 0 else (3, 224, 224)
 
-    # Call load_data without num_classes
+    # Load data
     dataset_train, dataset_test, data_loader_train, data_loader_test = load_data(
         args.data_path, args.batch_size, args.workers, dataset_type, input_size,
         distributed, args.augment, args.mixup, args.cutout, args.label_smoothing, args.T,
         args.triplet_list_train, args.triplet_list_val)
 
-    # Set num_classes for tripletface after loading dataset
-    num_classes = None  # Default
+    # Set num_classes after loading dataset
+    num_classes = None
     if dataset_type.lower() == 'tripletface':
         num_classes = len(dataset_train.classes)  # Number of identities
-    elif dataset_type == 'CIFAR10':
+    elif dataset_type.lower() == 'cifar10':
         num_classes = 10
     else:
-        raise ValueError(f"num_classes not set for dataset_type {dataset_type}")
+        raise ValueError(f"Unsupported dataset type: {dataset_type}")
 
     logger.info('dataset_train: {}, dataset_test: {}'.format(len(dataset_train), len(dataset_test)))
 
@@ -702,7 +726,7 @@ def main():
     model = create_model(
         args.model,
         T=args.T,
-        num_classes=embed_dim,  # Output embeddings, not logits
+        num_classes=embed_dim,  # Output embeddings for tripletface, classes for CIFAR10
         img_size=input_size[-1],
     ).cuda()
 
@@ -721,16 +745,16 @@ def main():
 
     # Loss function
     if dataset_type.lower() == 'tripletface':
-        criterion = ArcFaceLoss(embed_dim=embed_dim, num_classes=num_classes).cuda()  # <- Add .cuda()
+        criterion = ArcFaceLoss(embed_dim=embed_dim, num_classes=num_classes, 
+                                s=args.arcface_s, m=args.arcface_m).cuda()
         criterion_eval = TripletLoss(margin=0.2)
-    else:
-        margin = 0.2
-        criterion = TripletLoss(margin=margin)
-        criterion_eval = TripletLoss(margin=margin)
-
-    if args.TET:
-        criterion = CriterionWarpper(criterion, args.TET, args.TET_phi, args.TET_lambda)
-        criterion_eval = CriterionWarpper(criterion_eval)
+        if args.TET:
+            criterion = TETArcFaceLoss(embed_dim=embed_dim, num_classes=num_classes, 
+                                      s=args.arcface_s, m=args.arcface_m, 
+                                      TET_phi=args.TET_phi, TET_lambda=args.TET_lambda).cuda()
+    else:  # CIFAR10
+        criterion = nn.CrossEntropyLoss().cuda()
+        criterion_eval = nn.CrossEntropyLoss().cuda()
 
     # AMP speed up
     if args.amp:
@@ -789,7 +813,10 @@ def main():
         if distributed:
             logger.error('Using distribute mode in test, abort')
             return
-        test_triplet(model_without_ddp, data_loader_test, args.print_freq, logger)
+        if dataset_type.lower() == 'tripletface':
+            test_triplet(model_without_ddp, data_loader_test, args.print_freq, logger)
+        else:  # CIFAR10
+            test(model_without_ddp, data_loader_test, input_size, args, logger)
         return
 
     ##################################################
@@ -808,18 +835,28 @@ def main():
         logger.info('Epoch [{}] Start, lr {:.6f}'.format(epoch, optimizer.param_groups[0]["lr"]))
 
         with Timer(' Train', logger):
-            # Use train_one_epoch for ArcFace-based training
-            train_loss = train_one_epoch(model, criterion, optimizer,
-                                         data_loader_train, logger,
-                                         args.print_freq, world_size,
-                                         scheduler_per_iter, scaler)
+            if dataset_type.lower() == 'tripletface':
+                train_loss = train_one_epoch_triplet(model, criterion, optimizer,
+                                                     data_loader_train, logger,
+                                                     args.print_freq, world_size,
+                                                     scheduler_per_iter, scaler)
+            else:  # CIFAR10
+                train_loss = train_one_epoch(model, criterion, optimizer,
+                                             data_loader_train, logger,
+                                             args.print_freq, world_size,
+                                             scheduler_per_iter, scaler)
             if lr_scheduler is not None:
                 lr_scheduler.step(epoch + 1)
             if scheduler_per_epoch is not None:
                 scheduler_per_epoch.step()
 
         with Timer(' Test', logger):
-            test_loss, test_acc = test_triplet(model, data_loader_test, args.print_freq, logger)
+            if dataset_type.lower() == 'tripletface':
+                test_loss, test_acc = test_triplet(model, data_loader_test, args.print_freq, logger)
+            else:  # CIFAR10
+                test_loss, test_acc1, test_acc5 = evaluate(model, criterion_eval, data_loader_test,
+                                                           args.print_freq, logger)
+                test_acc = test_acc1  # Use top-1 accuracy for consistency
 
         if is_main_process() and tb_writer is not None:
             tb_record_triplet(tb_writer, train_loss, test_loss, test_acc, epoch)
@@ -895,15 +932,18 @@ def main():
     del dataset_train, dataset_test, data_loader_train, data_loader_test
     _, _, _, data_loader_test = load_data(
         args.data_path, args.batch_size, args.workers,
-        dataset_type, input_size, False,  # Removed num_classes
+        dataset_type, input_size, False,
         args.augment, args.mixup, args.cutout,
-        args.label_smoothing, args.T, 
+        args.label_smoothing, args.T,
         args.triplet_list_train, args.triplet_list_val
     )
 
     # Test
     if is_main_process():
-        test_triplet(model.cuda(), data_loader_test, args.print_freq, logger)
+        if dataset_type.lower() == 'tripletface':
+            test_triplet(model.cuda(), data_loader_test, args.print_freq, logger)
+        else:  # CIFAR10
+            test(model.cuda(), data_loader_test, input_size, args, logger)
     logger.info('All Done.')
 
 
