@@ -836,7 +836,7 @@ def main():
 
         with Timer(' Train', logger):
             if dataset_type.lower() == 'tripletface':
-                train_loss = train_one_epoch_triplet(model, criterion, optimizer,
+                train_loss = train_one_epoch(model, criterion, optimizer,
                                                      data_loader_train, logger,
                                                      args.print_freq, world_size,
                                                      scheduler_per_iter, scaler)
