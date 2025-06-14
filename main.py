@@ -16,7 +16,6 @@ from typing import Optional, Tuple
 import torchvision
 from torchvision import transforms
 from torch.utils.tensorboard.writer import SummaryWriter
-#from torch.cuda.amp import GradScaler, autocast
 from torch.cuda.amp.grad_scaler import GradScaler
 from torch.cuda.amp.autocast_mode import autocast
 import torch.distributed
@@ -63,7 +62,6 @@ def parse_args():
     parser.add_argument('--batch-size', default=32, type=int)
     parser.add_argument('--T', default=4, type=int, help='simulation steps')
     parser.add_argument('--model', default='spikingresformer_ti', help='model type')
-    # parser.add_argument('--dataset', default='ImageNet', help='dataset type')
     parser.add_argument('--augment', type=str, help='data augmentation')
     parser.add_argument('--mixup', type=bool, default=False, help='Mixup')
     parser.add_argument('--cutout', type=bool, default=False, help='Cutout')
@@ -73,13 +71,18 @@ def parse_args():
     parser.add_argument('--optimizer', type=str, default='adamw')
     parser.add_argument('--weight-decay', default=0, type=float, help='weight decay')
 
+    parser.add_argument('--local-rank', type=int, default=0, help='Local rank for distributed training')
+
     # Early stopping parameter
     parser.add_argument('--patience', default=5, type=int, 
                         help='Number of epochs to wait for improvement before early stopping')
 
     parser.add_argument('--print-freq', default=5, type=int,
                         help='Number of times a debug message is printed in one epoch')
-    parser.add_argument('--data-path', default='./datasets')
+    parser.add_argument('--data-path', default='./datasets', type=str,
+                        help='Path to training data directory')
+    parser.add_argument('--test-data-path', default=None, type=str,
+                        help='Path to test data directory (overrides triplet-list-val if provided)')
     parser.add_argument('--output-dir', default='./logs/temp')
     parser.add_argument('--resume', type=str, help='resume from checkpoint')
     parser.add_argument('--transfer', type=str, help='transfer from pretrained checkpoint')
@@ -90,7 +93,7 @@ def parse_args():
     parser.add_argument('--dataset', default='imagenet', type=str, help='Dataset name: imagenet or tripletface')
     parser.add_argument('--triplet-list-train', type=str, default='',
                         help='Path to training triplet list txt file')
-    parser.add_argument('--triplet-list-val',   type=str, default='',
+    parser.add_argument('--triplet-list-val', type=str, default='',
                         help='Path to validation triplet list txt file')
 
 
@@ -140,11 +143,6 @@ class ArcFaceLoss(nn.Module):
             pass
         else:
             raise ValueError(f"Unexpected embeddings shape: {embeddings.shape}")
-        
-        # # Debug prints
-        # print(f"ArcFace input embeddings shape: {embeddings.shape}")
-        # print(f"ArcFace labels shape: {labels.shape}")
-        # print(f"Weight shape: {self.weight.shape}")
         
         # Normalize embeddings and weights
         embeddings_norm = F.normalize(embeddings, p=2, dim=1)  # [B, embed_dim]
@@ -256,6 +254,7 @@ def load_data(
     T: int,
     triplet_list_train: str,
     triplet_list_val: str,
+    test_data_path: str = None,
 ):
     # Define common transforms for all datasets
     transform = transforms.Compose([
@@ -271,8 +270,14 @@ def load_data(
             root=dataset_dir,
             transform=transform
         )
-        # Validation set remains triplet-based
-        test_ds = TripletFaceDataset(triplet_list_val, transform=transform)
+        # Validation set: use test_data_path if provided, otherwise use triplet_list_val
+        if test_data_path is not None:
+            test_ds = torchvision.datasets.ImageFolder(
+                root=test_data_path,
+                transform=transform
+            )
+        else:
+            test_ds = TripletFaceDataset(triplet_list_val, transform=transform)
     elif dataset_type.lower() == 'cifar10':
         # CIFAR10 dataset
         train_ds = torchvision.datasets.CIFAR10(
@@ -342,13 +347,9 @@ def train_one_epoch(
             if scaler is not None:
                 with autocast():
                     embeddings = model(images)  # Shape: [T, B, embed_dim] or [B, embed_dim]
-                    # print(f"Raw embeddings shape: {embeddings.shape}")
-                    
-                    # Let ArcFace handle the dimension reduction
                     loss = criterion(embeddings, labels)
             else:
                 embeddings = model(images)
-                # print(f"Raw embeddings shape: {embeddings.shape}")
                 loss = criterion(embeddings, labels)
             
             metric_dict['loss'].update(loss.item())
@@ -459,20 +460,16 @@ def evaluate(model, criterion, data_loader, print_freq, logger, one_hot=None):
             if target.dim() > 1:
                 target = target.argmax(-1)
             acc1, acc5 = accuracy(output.mean(0), target, topk=(1, 5))
-            # FIXME need to take into account that the datasets
-            # could have been padded in distributed setup
             batch_size = image.shape[0]
             metric_dict['acc@1'].update(acc1.item(), batch_size)
             metric_dict['acc@5'].update(acc5.item(), batch_size)
 
             if print_freq != 0 and ((idx + 1) % int(len(data_loader) / print_freq)) == 0:
-                #torch.distributed.barrier()
                 metric_dict.sync()
                 logger.debug(' [{}/{}] loss: {:.5f}, acc@1: {:.5f}, acc@5: {:.5f}'.format(
                     idx + 1, len(data_loader), metric_dict['loss'].ave, metric_dict['acc@1'].ave,
                     metric_dict['acc@5'].ave))
 
-    #torch.distributed.barrier()
     metric_dict.sync()
     return metric_dict['loss'].ave, metric_dict['acc@1'].ave, metric_dict['acc@5'].ave
 
@@ -480,57 +477,44 @@ def evaluate_triplet(model, data_loader, print_freq, logger):
     model.eval()
     metric_dict = RecordDict({'loss': None, 'accuracy': None})
     
-    # Fix: Handle case where data_loader is empty or print_freq causes division by zero
     total_batches = len(data_loader)
     if total_batches == 0:
         logger.warning("Empty evaluation data loader")
         return 0.0, 0.0
     
-    # Calculate print interval safely
     if print_freq > 0 and total_batches > 0:
         print_interval = max(1, total_batches // print_freq)
     else:
-        print_interval = 0  # No printing
+        print_interval = 0
     
     with torch.no_grad():
         for idx, (anchor, positive, negative) in enumerate(data_loader):
-            # Move to GPU
             anchor   = anchor.cuda()
             positive = positive.cuda()
             negative = negative.cuda()
 
-            # Concatenate into a single batch: [3*B, C, H, W]
             images = torch.cat([anchor, positive, negative], dim=0)
-
-            # Forward pass: embeddings shape [T, 3*B, embed_dim]
             embeddings = model(images)
 
-            # Reshape to [T, B, 3, embed_dim]
             T, total, embed_dim = embeddings.shape
             B = total // 3
             embeddings = embeddings.reshape(T, B, 3, embed_dim)
 
-            # Split out the triplet views
-            anchor_e   = embeddings[:, :, 0]  # [T, B, embed_dim]
+            anchor_e   = embeddings[:, :, 0]
             positive_e = embeddings[:, :, 1]
             negative_e = embeddings[:, :, 2]
 
-            # Compute squared distances [T, B]
             pos_dist = torch.sum((anchor_e - positive_e) ** 2, dim=-1)
             neg_dist = torch.sum((anchor_e - negative_e) ** 2, dim=-1)
 
-            # Triplet loss: margin=0.2
             loss = torch.clamp(pos_dist - neg_dist + 0.2, min=0).mean()
-            metric_dict['loss'].update(loss.item())
-
-            # Accuracy: fraction of (pos_dist < neg_dist)
             correct = (pos_dist < neg_dist).float().mean()
+
+            metric_dict['loss'].update(loss.item())
             metric_dict['accuracy'].update(correct.item(), B)
 
-            # reset spiking states
             functional.reset_net(model)
 
-            # Logging with safe division
             if print_interval > 0 and ((idx + 1) % print_interval == 0):
                 metric_dict.sync()
                 logger.debug(
@@ -550,7 +534,6 @@ def test(
     args: argparse.Namespace,
     logger: logging.Logger,
 ):
-
     logger.info('[Test]')
     mon = SOPMonitor(model)
     model.eval()
@@ -569,8 +552,7 @@ def test(
             metric_dict['acc@1'].update(acc1.item(), batch_size)
             metric_dict['acc@5'].update(acc5.item(), batch_size)
 
-            if args.print_freq != 0 and ((idx + 1) %
-                                         int(len(data_loader_test) / args.print_freq)) == 0:
+            if args.print_freq != 0 and ((idx + 1) % int(len(data_loader_test) / args.print_freq)) == 0:
                 logger.debug('Test: [{}/{}]'.format(idx + 1, len(data_loader_test)))
         logger.info('Throughput: {:.5f} it/s'.format(
             len(data_loader_test) * args.batch_size / (time.time() - t)))
@@ -608,7 +590,6 @@ def test(
         sop = torch.cat(sublist).mean().item()
         sops = sops + sop
     sops = sops / (1000**3)
-    # input is [N, C, H, W] or [T*N, C, H, W]
     sops = sops / args.batch_size
     if step_mode == 's':
         sops = sops * args.T
@@ -625,30 +606,25 @@ def test_triplet(
     model.eval()
     metric_dict = RecordDict({'loss': None, 'accuracy': None})
     
-    # Fix: Handle case where data_loader is empty or print_freq causes division by zero
     total_batches = len(data_loader_test)
     if total_batches == 0:
         logger.warning("Empty test data loader")
         return 0.0, 0.0
     
-    # Calculate print interval safely
     if print_freq > 0 and total_batches > 0:
         print_interval = max(1, total_batches // print_freq)
     else:
-        print_interval = 0  # No printing
+        print_interval = 0
     
     with torch.no_grad():
         for idx, (anchor, positive, negative) in enumerate(data_loader_test):
-            # Move all to GPU
             anchor   = anchor.cuda()
             positive = positive.cuda()
             negative = negative.cuda()
 
-            # Build a single batch
             images = torch.cat([anchor, positive, negative], dim=0)
-            embeddings = model(images)  # [T, 3*B, D]
+            embeddings = model(images)
 
-            # Reshape to separate triplets
             T, total, D = embeddings.shape
             B = total // 3
             embeddings = embeddings.view(T, B, 3, D)
@@ -656,11 +632,9 @@ def test_triplet(
             p_e = embeddings[:, :, 1]
             n_e = embeddings[:, :, 2]
 
-            # Compute distances
-            pos_dist = torch.sum((a_e - p_e) ** 2, dim=-1)  # [T, B]
-            neg_dist = torch.sum((a_e - n_e) ** 2, dim=-1)  # [T, B]
+            pos_dist = torch.sum((a_e - p_e) ** 2, dim=-1)
+            neg_dist = torch.sum((a_e - n_e) ** 2, dim=-1)
 
-            # Triplet loss + accuracy
             loss = torch.clamp(pos_dist - neg_dist + margin, min=0).mean()
             correct = (pos_dist < neg_dist).float().mean()
 
@@ -669,7 +643,6 @@ def test_triplet(
 
             functional.reset_net(model)
 
-            # Logging with safe division
             if print_interval > 0 and ((idx + 1) % print_interval == 0):
                 metric_dict.sync()
                 logger.debug(
@@ -713,7 +686,7 @@ def main():
     dataset_train, dataset_test, data_loader_train, data_loader_test = load_data(
         args.data_path, args.batch_size, args.workers, dataset_type, input_size,
         distributed, args.augment, args.mixup, args.cutout, args.label_smoothing, args.T,
-        args.triplet_list_train, args.triplet_list_val)
+        args.triplet_list_train, args.triplet_list_val, args.test_data_path)
 
     # Set num_classes after loading dataset
     num_classes = None
@@ -936,14 +909,14 @@ def main():
         logger.warning('Exit.')
         return
 
-    # Reload data
+    # Reload data using test_data_path
     del dataset_train, dataset_test, data_loader_train, data_loader_test
     _, _, _, data_loader_test = load_data(
-        args.data_path, args.batch_size, args.workers,
+        args.test_data_path if args.test_data_path else args.data_path, args.batch_size, args.workers,
         dataset_type, input_size, False,
         args.augment, args.mixup, args.cutout,
         args.label_smoothing, args.T,
-        args.triplet_list_train, args.triplet_list_val
+        args.triplet_list_train, args.triplet_list_val, args.test_data_path
     )
 
     # Test
