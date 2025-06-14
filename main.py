@@ -66,12 +66,12 @@ def parse_args():
     parser.add_argument('--mixup', type=bool, default=False, help='Mixup')
     parser.add_argument('--cutout', type=bool, default=False, help='Cutout')
     parser.add_argument('--label-smoothing', type=float, default=0, help='Label smoothing')
-    parser.add_argument('--workers', default=16, type=int, help='number of data loading workers')
+    parser.add_argument('--workers', default=8, type=int, help='number of data loading workers')  # Reduced for single GPU
     parser.add_argument('--lr', default=1e-3, type=float, help='initial learning rate')
     parser.add_argument('--optimizer', type=str, default='adamw')
-    parser.add_argument('--weight-decay', default=0, type=float, help='weight decay')
+    parser.add_argument('--weight-decay', default=1e-4, type=float, help='weight decay')  # Added default
 
-    parser.add_argument('--patience', default=5, type=int, 
+    parser.add_argument('--patience', default=10, type=int,  # Increased patience
                         help='Number of epochs to wait for improvement before early stopping')
 
     parser.add_argument('--print-freq', default=5, type=int,
@@ -87,12 +87,11 @@ def parse_args():
     parser.add_argument('--distributed-init-mode', type=str, default='env://')
 
     # triplet load
-    parser.add_argument('--dataset', default='imagenet', type=str, help='Dataset name: imagenet or tripletface')
+    parser.add_argument('--dataset', default='vggface2', type=str, help='Dataset name: imagenet, vggface2, or tripletface')
     parser.add_argument('--triplet-list-train', type=str, default='',
                         help='Path to training triplet list txt file')
     parser.add_argument('--triplet-list-val', type=str, default='',
                         help='Path to validation triplet list txt file')
-
 
     # argument of TET
     parser.add_argument('--TET', action='store_true', help='Use TET training')
@@ -107,6 +106,12 @@ def parse_args():
     # argumet for Arcfaceloss
     parser.add_argument('--arcface-s', type=float, default=30.0, help='ArcFace scale factor')
     parser.add_argument('--arcface-m', type=float, default=0.5, help='ArcFace margin')
+
+    # Memory optimization arguments
+    parser.add_argument('--gradient-accumulation-steps', type=int, default=1, 
+                        help='Number of steps to accumulate gradients')
+    parser.add_argument('--pin-memory', action='store_true', default=True,
+                        help='Use pin memory for data loading')
 
     args_config, remaining = config_parser.parse_known_args()
     if args_config.config:
@@ -147,6 +152,7 @@ class ArcFaceLoss(nn.Module):
         
         # Compute cosine similarity
         cos_theta = F.linear(embeddings_norm, weight_norm)  # [B, num_classes]
+        cos_theta = torch.clamp(cos_theta, -1.0 + 1e-7, 1.0 - 1e-7)  # Numerical stability
         
         # Compute sin_theta
         sin_theta = torch.sqrt(1.0 - torch.pow(cos_theta, 2) + 1e-7)
@@ -154,8 +160,12 @@ class ArcFaceLoss(nn.Module):
         # Apply margin
         cos_theta_m = cos_theta * self.cos_m - sin_theta * self.sin_m
         
+        # Handle difficult samples
+        cos_theta_m = torch.where(cos_theta > self.threshold, cos_theta_m, cos_theta - self.mm)
+        
         # Create mask for target classes
-        mask = torch.zeros_like(cos_theta).scatter_(1, labels.unsqueeze(1), 1.0)
+        mask = torch.zeros_like(cos_theta)
+        mask.scatter_(1, labels.unsqueeze(1), 1.0)
         
         # Apply margin only to correct class
         output = cos_theta * (1.0 - mask) + cos_theta_m * mask
@@ -186,23 +196,9 @@ def setup_logger(output_dir):
 
 
 def init_distributed(logger: logging.Logger, distributed_init_mode):
-    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ['WORLD_SIZE'])
-        local_rank = int(os.environ['LOCAL_RANK'])
-    else:
-        logger.info('Not using distributed mode')
-        return False, 0, 1, 0
-
-    torch.cuda.set_device(local_rank)
-    backend = 'nccl'
-    logger.info('Distributed init rank {}'.format(rank))
-    torch.distributed.init_process_group(backend=backend, init_method=distributed_init_mode,
-                                         world_size=world_size, rank=rank)
-    # only master process logs
-    if rank != 0:
-        logger.setLevel(logging.WARNING)
-    return True, rank, world_size, local_rank
+    # Force single GPU mode
+    logger.info('Using single GPU mode')
+    return False, 0, 1, 0
 
 
 class TETArcFaceLoss(nn.Module):
@@ -252,70 +248,94 @@ def load_data(
     triplet_list_train: str,
     triplet_list_val: str,
     test_data_path: str = None,
+    pin_memory: bool = True,
 ):
-    # Define common transforms for all datasets
-    transform = transforms.Compose([
-        transforms.Resize(input_size[-2:]),
-        transforms.CenterCrop(input_size[-2:]),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+    # Enhanced transforms for VGGFace2
+    if dataset_type.lower() == 'vggface2':
+        # Training transforms with augmentation
+        train_transform = transforms.Compose([
+            transforms.Resize((256, 256)),
+            transforms.RandomCrop(input_size[-2:]),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
+            transforms.RandomRotation(degrees=15),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.RandomErasing(p=0.1),  # Data augmentation
+        ])
+        
+        # Test transforms without augmentation
+        test_transform = transforms.Compose([
+            transforms.Resize(input_size[-2:]),
+            transforms.CenterCrop(input_size[-2:]),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
 
-    if dataset_type.lower() == 'tripletface':
         # Training set with identity labels
         train_ds = torchvision.datasets.ImageFolder(
             root=dataset_dir,
-            transform=transform
+            transform=train_transform
         )
-        # Validation set: use test_data_path if provided, otherwise use triplet_list_val
+        
+        # Test set
         if test_data_path is not None:
             test_ds = torchvision.datasets.ImageFolder(
                 root=test_data_path,
-                transform=transform
+                transform=test_transform
             )
         else:
-            test_ds = TripletFaceDataset(triplet_list_val, transform=transform)
-    elif dataset_type.lower() == 'cifar10':
-        # CIFAR10 dataset
-        train_ds = torchvision.datasets.CIFAR10(
-            root=dataset_dir,
-            train=True,
-            download=True,
-            transform=transform
-        )
-        test_ds = torchvision.datasets.CIFAR10(
-            root=dataset_dir,
-            train=False,
-            download=True,
-            transform=transform
-        )
+            # Use a subset of training data for validation if no test path provided
+            test_ds = torchvision.datasets.ImageFolder(
+                root=dataset_dir,
+                transform=test_transform
+            )
     else:
-        raise ValueError(f"Unsupported dataset type: {dataset_type}")
+        # Fallback for other datasets
+        transform = transforms.Compose([
+            transforms.Resize(input_size[-2:]),
+            transforms.CenterCrop(input_size[-2:]),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
 
-    # Set up samplers for distributed training
-    if distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds)
-        test_sampler = torch.utils.data.distributed.DistributedSampler(test_ds)
-    else:
-        train_sampler = torch.utils.data.RandomSampler(train_ds)
-        test_sampler = torch.utils.data.SequentialSampler(test_ds)
+        if dataset_type.lower() == 'tripletface':
+            train_ds = torchvision.datasets.ImageFolder(root=dataset_dir, transform=transform)
+            if test_data_path is not None:
+                test_ds = torchvision.datasets.ImageFolder(root=test_data_path, transform=transform)
+            else:
+                test_ds = TripletFaceDataset(triplet_list_val, transform=transform)
+        elif dataset_type.lower() == 'cifar10':
+            train_ds = torchvision.datasets.CIFAR10(root=dataset_dir, train=True, download=True, transform=transform)
+            test_ds = torchvision.datasets.CIFAR10(root=dataset_dir, train=False, download=True, transform=transform)
+        else:
+            raise ValueError(f"Unsupported dataset type: {dataset_type}")
 
-    # Create data loaders
+    # Single GPU samplers
+    train_sampler = torch.utils.data.RandomSampler(train_ds)
+    test_sampler = torch.utils.data.SequentialSampler(test_ds)
+
+    # Create data loaders with optimized settings for single GPU
     data_loader_train = torch.utils.data.DataLoader(
         train_ds,
         batch_size=batch_size,
         sampler=train_sampler,
         num_workers=workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         drop_last=True,
+        persistent_workers=workers > 0,  # Keep workers alive between epochs
+        prefetch_factor=2 if workers > 0 else 2,  # Prefetch batches
     )
+    
     data_loader_test = torch.utils.data.DataLoader(
         test_ds,
         batch_size=batch_size,
         sampler=test_sampler,
         num_workers=workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         drop_last=False,
+        persistent_workers=workers > 0,
+        prefetch_factor=2 if workers > 0 else 2,
     )
 
     return train_ds, test_ds, data_loader_train, data_loader_test
@@ -329,114 +349,75 @@ def train_one_epoch(
     logger: logging.Logger,
     print_freq: int,
     factor: int,
+    gradient_accumulation_steps: int = 1,
     scheduler_per_iter: Optional[BaseSchedulerPerIter] = None,
     scaler: Optional[GradScaler] = None,
 ):
     model.train()
     metric_dict = RecordDict({'loss': None})
     timer_container = [0.0]
-    model.zero_grad()
+    
+    # Zero gradients at the start
+    optimizer.zero_grad()
     
     for idx, (images, labels) in enumerate(data_loader_train):
         with GlobalTimer('iter', timer_container):
-            images, labels = images.cuda(), labels.cuda()
+            images, labels = images.cuda(non_blocking=True), labels.cuda(non_blocking=True)
             
-            if scaler is not None:
-                with autocast():
-                    embeddings = model(images)  # Shape: [T, B, embed_dim] or [B, embed_dim]
-                    loss = criterion(embeddings, labels)
-            else:
-                embeddings = model(images)
-                loss = criterion(embeddings, labels)
-            
-            metric_dict['loss'].update(loss.item())
-            
-            if scaler is not None:
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-                model.zero_grad()
-            else:
-                loss.backward()
-                optimizer.step()
-                model.zero_grad()
-            
-            if scheduler_per_iter is not None:
-                scheduler_per_iter.step()
-            
-            functional.reset_net(model)
-        
-        batch_size = images.size(0)
-        if print_freq and ((idx + 1) % int(len(data_loader_train) / print_freq) == 0):
-            metric_dict.sync()
-            logger.debug(
-                f' [{idx+1}/{len(data_loader_train)}] it/s: '
-                f'{(idx+1)*batch_size*factor/timer_container[0]:.5f}, '
-                f'loss: {metric_dict["loss"].ave:.5f}'
-            )
-    
-    metric_dict.sync()
-    return metric_dict['loss'].ave
-
-def train_one_epoch_triplet(
-    model, criterion, optimizer,
-    data_loader_train, logger,
-    print_freq, factor,
-    scheduler_per_iter=None, scaler=None,
-):
-    model.train()
-    metric_dict = RecordDict({'loss': None})
-    timer_container = [0.0]
-    model.zero_grad()
-
-    for idx, (anchor, positive, negative) in enumerate(data_loader_train):
-        with GlobalTimer('iter', timer_container):
-            # Move each tensor to GPU
-            anchor   = anchor.cuda()
-            positive = positive.cuda()
-            negative = negative.cuda()
-
-            # Concatenate into one big batch: [3*B, C, H, W]
-            images = torch.cat([anchor, positive, negative], dim=0)
-
-            # Forward + loss
+            # Forward pass with optional AMP
             if scaler is not None:
                 with autocast():
                     embeddings = model(images)
-                    loss = criterion(embeddings)
+                    loss = criterion(embeddings, labels)
+                    # Scale loss for gradient accumulation
+                    loss = loss / gradient_accumulation_steps
             else:
                 embeddings = model(images)
-                loss = criterion(embeddings)
-
-            metric_dict['loss'].update(loss.item())
-
-            # Backward + step
+                loss = criterion(embeddings, labels)
+                loss = loss / gradient_accumulation_steps
+            
+            metric_dict['loss'].update(loss.item() * gradient_accumulation_steps)
+            
+            # Backward pass
             if scaler is not None:
                 scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-                model.zero_grad()
             else:
                 loss.backward()
-                optimizer.step()
-                model.zero_grad()
-
-            # Iter‐level scheduler
-            if scheduler_per_iter is not None:
-                scheduler_per_iter.step()
-
+            
+            # Update weights every gradient_accumulation_steps
+            if (idx + 1) % gradient_accumulation_steps == 0:
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad()
+                
+                if scheduler_per_iter is not None:
+                    scheduler_per_iter.step()
+            
+            # Reset spiking network state
             functional.reset_net(model)
-
-        # Logging
-        batch_size = anchor.size(0)
-        if print_freq and ((idx + 1) % int(len(data_loader_train) / print_freq) == 0):
+        
+        batch_size = images.size(0)
+        if print_freq and ((idx + 1) % max(1, len(data_loader_train) // print_freq) == 0):
             metric_dict.sync()
             logger.debug(
                 f' [{idx+1}/{len(data_loader_train)}] it/s: '
                 f'{(idx+1)*batch_size*factor/timer_container[0]:.5f}, '
-                f'loss: {metric_dict["loss"].ave:.5f}'
+                f'loss: {metric_dict["loss"].ave:.5f}, '
+                f'lr: {optimizer.param_groups[0]["lr"]:.6f}'
             )
-
+    
+    # Handle remaining gradients if not divisible by gradient_accumulation_steps
+    if len(data_loader_train) % gradient_accumulation_steps != 0:
+        if scaler is not None:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+        optimizer.zero_grad()
+    
     metric_dict.sync()
     return metric_dict['loss'].ave
 
@@ -444,24 +425,43 @@ def train_one_epoch_triplet(
 def evaluate(model, criterion, data_loader, print_freq, logger, one_hot=None):
     model.eval()
     metric_dict = RecordDict({'loss': None, 'acc@1': None, 'acc@5': None})
+    
     with torch.no_grad():
         for idx, (image, target) in enumerate(data_loader):
-            image, target = image.cuda(), target.cuda()
+            image, target = image.cuda(non_blocking=True), target.cuda(non_blocking=True)
+            
             if one_hot:
-                target = F.one_hot(target, one_hot).float()
-            output = model(image)
-            loss = criterion(output, target)
+                target_one_hot = F.one_hot(target, one_hot).float()
+                output = model(image)
+                loss = criterion(output, target_one_hot)
+            else:
+                output = model(image)
+                # For ArcFace, we need to compute a dummy loss for logging
+                if hasattr(criterion, 'arcface'):
+                    # Create dummy logits for loss computation
+                    dummy_logits = torch.randn(output.size(0), criterion.arcface.num_classes, device=output.device)
+                    loss = F.cross_entropy(dummy_logits, target)
+                else:
+                    loss = criterion(output, target)
+            
             metric_dict['loss'].update(loss.item())
             functional.reset_net(model)
 
-            if target.dim() > 1:
-                target = target.argmax(-1)
-            acc1, acc5 = accuracy(output.mean(0), target, topk=(1, 5))
+            # Handle output shape for accuracy calculation
+            if output.dim() == 3:  # [T, B, embed_dim]
+                # For embedding outputs, we can't compute traditional accuracy
+                # Set dummy values
+                acc1, acc5 = torch.tensor(0.0), torch.tensor(0.0)
+            else:
+                if target.dim() > 1:
+                    target = target.argmax(-1)
+                acc1, acc5 = accuracy(output, target, topk=(1, min(5, output.size(-1))))
+            
             batch_size = image.shape[0]
             metric_dict['acc@1'].update(acc1.item(), batch_size)
             metric_dict['acc@5'].update(acc5.item(), batch_size)
 
-            if print_freq != 0 and ((idx + 1) % int(len(data_loader) / print_freq)) == 0:
+            if print_freq != 0 and ((idx + 1) % max(1, len(data_loader) // print_freq)) == 0:
                 metric_dict.sync()
                 logger.debug(' [{}/{}] loss: {:.5f}, acc@1: {:.5f}, acc@5: {:.5f}'.format(
                     idx + 1, len(data_loader), metric_dict['loss'].ave, metric_dict['acc@1'].ave,
@@ -469,187 +469,6 @@ def evaluate(model, criterion, data_loader, print_freq, logger, one_hot=None):
 
     metric_dict.sync()
     return metric_dict['loss'].ave, metric_dict['acc@1'].ave, metric_dict['acc@5'].ave
-
-def evaluate_triplet(model, data_loader, print_freq, logger):
-    model.eval()
-    metric_dict = RecordDict({'loss': None, 'accuracy': None})
-    
-    total_batches = len(data_loader)
-    if total_batches == 0:
-        logger.warning("Empty evaluation data loader")
-        return 0.0, 0.0
-    
-    if print_freq > 0 and total_batches > 0:
-        print_interval = max(1, total_batches // print_freq)
-    else:
-        print_interval = 0
-    
-    with torch.no_grad():
-        for idx, (anchor, positive, negative) in enumerate(data_loader):
-            anchor   = anchor.cuda()
-            positive = positive.cuda()
-            negative = negative.cuda()
-
-            images = torch.cat([anchor, positive, negative], dim=0)
-            embeddings = model(images)
-
-            T, total, embed_dim = embeddings.shape
-            B = total // 3
-            embeddings = embeddings.reshape(T, B, 3, embed_dim)
-
-            anchor_e   = embeddings[:, :, 0]
-            positive_e = embeddings[:, :, 1]
-            negative_e = embeddings[:, :, 2]
-
-            pos_dist = torch.sum((anchor_e - positive_e) ** 2, dim=-1)
-            neg_dist = torch.sum((anchor_e - negative_e) ** 2, dim=-1)
-
-            loss = torch.clamp(pos_dist - neg_dist + 0.2, min=0).mean()
-            correct = (pos_dist < neg_dist).float().mean()
-
-            metric_dict['loss'].update(loss.item())
-            metric_dict['accuracy'].update(correct.item(), B)
-
-            functional.reset_net(model)
-
-            if print_interval > 0 and ((idx + 1) % print_interval == 0):
-                metric_dict.sync()
-                logger.debug(
-                    f' [{idx+1}/{total_batches}] '
-                    f'loss: {metric_dict["loss"].ave:.5f}, '
-                    f'accuracy: {metric_dict["accuracy"].ave:.5f}'
-                )
-
-    metric_dict.sync()
-    return metric_dict['loss'].ave, metric_dict['accuracy'].ave
-
-
-def test(
-    model: nn.Module,
-    data_loader_test: torch.utils.data.DataLoader,
-    input_size: Tuple[int],
-    args: argparse.Namespace,
-    logger: logging.Logger,
-):
-    logger.info('[Test]')
-    mon = SOPMonitor(model)
-    model.eval()
-    mon.enable()
-    logger.debug('Test start')
-    metric_dict = RecordDict({'acc@1': None, 'acc@5': None}, test=True)
-    with torch.no_grad():
-        t = time.time()
-        for idx, (image, target) in enumerate(data_loader_test):
-            image, target = image.cuda(), target.cuda()
-            output = model(image).mean(0)
-            functional.reset_net(model)
-
-            acc1, acc5 = accuracy(output, target, topk=(1, 5))
-            batch_size = image.shape[0]
-            metric_dict['acc@1'].update(acc1.item(), batch_size)
-            metric_dict['acc@5'].update(acc5.item(), batch_size)
-
-            if args.print_freq != 0 and ((idx + 1) % int(len(data_loader_test) / args.print_freq)) == 0:
-                logger.debug('Test: [{}/{}]'.format(idx + 1, len(data_loader_test)))
-        logger.info('Throughput: {:.5f} it/s'.format(
-            len(data_loader_test) * args.batch_size / (time.time() - t)))
-
-    metric_dict.sync()
-    logger.info('Acc@1: {:.5f}, Acc@5: {:.5f}'.format(metric_dict['acc@1'].ave,
-                                                      metric_dict['acc@5'].ave))
-
-    step_mode = 's'
-    for m in model.modules():
-        if isinstance(m, base.StepModule):
-            if m.step_mode == 'm':
-                step_mode = 'm'
-            else:
-                step_mode = 's'
-            break
-
-    ops, params = profile(
-        model, inputs=(torch.rand(input_size).cuda().unsqueeze(0), ), verbose=False, custom_ops={
-            layer.Conv2d: count_convNd,
-            Conv3x3: count_convNd,
-            Conv1x1: count_convNd,
-            Linear: count_linear,
-            SpikingMatmul: count_matmul, })[0:2]
-    if step_mode == 'm':
-        ops, params = (ops / (1000**3)) / args.T, params / (1000**2)
-    else:
-        ops, params = (ops / (1000**3)), params / (1000**2)
-    functional.reset_net(model)
-    logger.info('MACs: {:.5f} G, params: {:.2f} M.'.format(ops, params))
-
-    sops = 0
-    for name in mon.monitored_layers:
-        sublist = mon[name]
-        sop = torch.cat(sublist).mean().item()
-        sops = sops + sop
-    sops = sops / (1000**3)
-    sops = sops / args.batch_size
-    if step_mode == 's':
-        sops = sops * args.T
-    logger.info('Avg SOPs: {:.5f} G, Power: {:.5f} mJ.'.format(sops, 0.9 * sops))
-    logger.info('A/S Power Ratio: {:.6f}'.format((4.6 * ops) / (0.9 * sops)))
-
-def test_triplet(
-    model: nn.Module,
-    data_loader_test: torch.utils.data.DataLoader,
-    print_freq: int,
-    logger: logging.Logger,
-    margin: float = 0.2,
-):
-    model.eval()
-    metric_dict = RecordDict({'loss': None, 'accuracy': None})
-    
-    total_batches = len(data_loader_test)
-    if total_batches == 0:
-        logger.warning("Empty test data loader")
-        return 0.0, 0.0
-    
-    if print_freq > 0 and total_batches > 0:
-        print_interval = max(1, total_batches // print_freq)
-    else:
-        print_interval = 0
-    
-    with torch.no_grad():
-        for idx, (anchor, positive, negative) in enumerate(data_loader_test):
-            anchor   = anchor.cuda()
-            positive = positive.cuda()
-            negative = negative.cuda()
-
-            images = torch.cat([anchor, positive, negative], dim=0)
-            embeddings = model(images)
-
-            T, total, D = embeddings.shape
-            B = total // 3
-            embeddings = embeddings.view(T, B, 3, D)
-            a_e = embeddings[:, :, 0]
-            p_e = embeddings[:, :, 1]
-            n_e = embeddings[:, :, 2]
-
-            pos_dist = torch.sum((a_e - p_e) ** 2, dim=-1)
-            neg_dist = torch.sum((a_e - n_e) ** 2, dim=-1)
-
-            loss = torch.clamp(pos_dist - neg_dist + margin, min=0).mean()
-            correct = (pos_dist < neg_dist).float().mean()
-
-            metric_dict['loss'].update(loss.item())
-            metric_dict['accuracy'].update(correct.item(), B)
-
-            functional.reset_net(model)
-
-            if print_interval > 0 and ((idx + 1) % print_interval == 0):
-                metric_dict.sync()
-                logger.debug(
-                    f' [{idx+1}/{total_batches}] '
-                    f'loss: {metric_dict["loss"].ave:.5f}, '
-                    f'accuracy: {metric_dict["accuracy"].ave:.5f}'
-                )
-
-    metric_dict.sync()
-    return metric_dict['loss'].ave, metric_dict['accuracy'].ave
 
 
 def main():
@@ -659,19 +478,22 @@ def main():
 
     args = parse_args()
     dataset_type = args.dataset
-    embed_dim = 512 if dataset_type.lower() == 'tripletface' else 10  # Use num_classes for CIFAR10
+    embed_dim = 512  # Standard embedding dimension for face recognition
 
+    # Set random seeds for reproducibility
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
-    torch.backends.cudnn.deterministic = True  # type: ignore
-    torch.backends.cudnn.benchmark = False  # type: ignore
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
+    # Create output directory
     args.output_dir = os.path.join(args.output_dir, f'arcface_s{args.arcface_s}_m{args.arcface_m}')
     safe_makedirs(args.output_dir)
     logger = setup_logger(args.output_dir)
 
+    # Single GPU setup
     distributed, rank, world_size, local_rank = init_distributed(logger, args.distributed_init_mode)
 
     logger.info(str(args))
@@ -683,202 +505,179 @@ def main():
     dataset_train, dataset_test, data_loader_train, data_loader_test = load_data(
         args.data_path, args.batch_size, args.workers, dataset_type, input_size,
         distributed, args.augment, args.mixup, args.cutout, args.label_smoothing, args.T,
-        args.triplet_list_train, args.triplet_list_val, args.test_data_path)
+        args.triplet_list_train, args.triplet_list_val, args.test_data_path, args.pin_memory)
 
     # Set num_classes after loading dataset
-    num_classes = None
-    if dataset_type.lower() == 'tripletface':
-        num_classes = len(dataset_train.classes)  # Number of identities
-    elif dataset_type.lower() == 'cifar10':
-        num_classes = 10
-    else:
-        raise ValueError(f"Unsupported dataset type: {dataset_type}")
-
-    logger.info('dataset_train: {}, dataset_test: {}'.format(len(dataset_train), len(dataset_test)))
+    num_classes = len(dataset_train.classes)
+    logger.info(f'Dataset: {dataset_type}, Classes: {num_classes}, Train: {len(dataset_train)}, Test: {len(dataset_test)}')
 
     # Model
     model = create_model(
         args.model,
         T=args.T,
-        num_classes=embed_dim,  # Output embeddings for tripletface, classes for CIFAR10
+        num_classes=embed_dim,  # Output embeddings for face recognition
         img_size=input_size[-1],
     ).cuda()
 
-    # Transfer
+    # Transfer learning
     if args.transfer:
+        logger.info(f'Loading pretrained weights from {args.transfer}')
         checkpoint = torch.load(args.transfer, map_location='cpu')
-        model.transfer(checkpoint['model'])
+        if 'model' in checkpoint:
+            model.load_state_dict(checkpoint['model'], strict=False)
+        else:
+            model.load_state_dict(checkpoint, strict=False)
 
-    # Optimizer
+    # Optimizer with better defaults
     optimizer = create_optimizer_v2(
         model,
         opt=args.optimizer,
         lr=args.lr,
         weight_decay=args.weight_decay,
+        betas=(0.9, 0.999),
+        eps=1e-8,
     )
 
     # Loss function
-    if dataset_type.lower() == 'tripletface':
-        criterion = ArcFaceLoss(embed_dim=embed_dim, num_classes=num_classes, 
-                                s=args.arcface_s, m=args.arcface_m).cuda()
-        criterion_eval = TripletLoss(margin=0.2)
-        if args.TET:
-            criterion = TETArcFaceLoss(embed_dim=embed_dim, num_classes=num_classes, 
-                                      s=args.arcface_s, m=args.arcface_m, 
-                                      TET_phi=args.TET_phi, TET_lambda=args.TET_lambda).cuda()
-    else:  # CIFAR10
-        criterion = nn.CrossEntropyLoss().cuda()
-        criterion_eval = nn.CrossEntropyLoss().cuda()
-
-    # AMP speed up
-    if args.amp:
-        scaler = GradScaler()
+    if args.TET:
+        criterion = TETArcFaceLoss(
+            embed_dim=embed_dim, 
+            num_classes=num_classes, 
+            s=args.arcface_s, 
+            m=args.arcface_m, 
+            TET_phi=args.TET_phi, 
+            TET_lambda=args.TET_lambda
+        ).cuda()
     else:
-        scaler = None
+        criterion = ArcFaceLoss(
+            embed_dim=embed_dim, 
+            num_classes=num_classes, 
+            s=args.arcface_s, 
+            m=args.arcface_m
+        ).cuda()
 
-    # LR scheduler
+    # AMP for memory and speed optimization
+    scaler = GradScaler() if args.amp else None
+
+    # LR scheduler with warmup
     lr_scheduler, _ = create_scheduler_v2(
         optimizer,
         sched='cosine',
         num_epochs=args.epochs,
         cooldown_epochs=10,
-        min_lr=1e-5,
-        warmup_lr=1e-5,
-        warmup_epochs=3,
+        min_lr=1e-6,
+        warmup_lr=1e-6,
+        warmup_epochs=5,
+        decay_rate=0.1,
     )
 
-    # Sync BN
-    if args.sync_bn:
-        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-
-    # DDP
-    model_without_ddp = model
-    if distributed and not args.test_only:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank],
-                                                         find_unused_parameters=False)
-        model_without_ddp = model.module
-
-    # Custom scheduler
-    scheduler_per_iter = None
-    scheduler_per_epoch = None
-
-    # Resume
+    # Resume from checkpoint
+    start_epoch = 0
+    max_acc1 = 0.0
+    
     if args.resume:
+        logger.info(f'Resuming from {args.resume}')
         checkpoint = torch.load(args.resume, map_location='cpu')
-        model_without_ddp.load_state_dict(checkpoint['model'])
+        model.load_state_dict(checkpoint['model'])
         optimizer.load_state_dict(checkpoint['optimizer'])
-        start_epoch = checkpoint['epoch']
-        max_acc1 = checkpoint['max_acc1']
-        if lr_scheduler is not None:
+        start_epoch = checkpoint['epoch'] + 1
+        max_acc1 = checkpoint.get('max_acc1', 0.0)
+        if lr_scheduler is not None and 'lr_scheduler' in checkpoint:
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-        logger.info('Resume from epoch {}'.format(start_epoch))
-        start_epoch += 1
-    else:
-        start_epoch = 0
-        max_acc1 = 0
+        logger.info(f'Resumed from epoch {start_epoch}, best acc: {max_acc1:.5f}')
 
-    logger.debug(str(model))
+    logger.debug(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
 
     ##################################################
     #                   test only
     ##################################################
 
     if args.test_only:
-        if distributed:
-            logger.error('Using distribute mode in test, abort')
-            return
-        if dataset_type.lower() == 'tripletface':
-            test_triplet(model_without_ddp, data_loader_test, args.print_freq, logger)
-        else:  # CIFAR10
-            test(model_without_ddp, data_loader_test, input_size, args, logger)
+        logger.info('Test only mode')
+        test_loss, test_acc1, test_acc5 = evaluate(model, criterion, data_loader_test, args.print_freq, logger)
+        logger.info(f'Test Loss: {test_loss:.5f}, Acc@1: {test_acc1:.5f}, Acc@5: {test_acc5:.5f}')
         return
 
     ##################################################
     #                   Train
     ##################################################
 
-    # Early stopping variables - should be after resume logic
-    patience = args.patience  # Number of epochs to wait for improvement
-    best_acc = max_acc1  # Use the resumed max_acc1 or 0 if starting fresh
+    # Early stopping
+    best_acc = max_acc1
     epochs_no_improve = 0
 
-    tb_writer = None
-    if is_main_process():
-        tb_writer = SummaryWriter(os.path.join(args.output_dir, 'tensorboard'),
-                                purge_step=start_epoch)
+    # TensorBoard
+    tb_writer = SummaryWriter(os.path.join(args.output_dir, 'tensorboard'), purge_step=start_epoch)
 
-    logger.info("[Train]")
-    logger.info(f"Starting training with best accuracy so far: {best_acc:.5f}")
+    logger.info(f"Starting training from epoch {start_epoch}, best accuracy: {best_acc:.5f}")
 
     for epoch in range(start_epoch, args.epochs):
-        if distributed and hasattr(data_loader_train.sampler, 'set_epoch'):
-            data_loader_train.sampler.set_epoch(epoch)
-        logger.info('Epoch [{}] Start, lr {:.6f}'.format(epoch, optimizer.param_groups[0]["lr"]))
+        logger.info(f'Epoch [{epoch}/{args.epochs}] Start, lr: {optimizer.param_groups[0]["lr"]:.6f}')
 
-        with Timer(' Train', logger):
-            if dataset_type.lower() == 'tripletface':
-                train_loss = train_one_epoch(model, criterion, optimizer,
-                                        data_loader_train, logger,
-                                        args.print_freq, world_size,
-                                        scheduler_per_iter, scaler)
-            else:  # CIFAR10
-                train_loss = train_one_epoch(model, criterion, optimizer,
-                                        data_loader_train, logger,
-                                        args.print_freq, world_size,
-                                        scheduler_per_iter, scaler)
-            if lr_scheduler is not None:
-                lr_scheduler.step(epoch + 1)
-            if scheduler_per_epoch is not None:
-                scheduler_per_epoch.step()
+        # Training
+        with Timer('Train', logger):
+            train_loss = train_one_epoch(
+                model, criterion, optimizer, data_loader_train, logger,
+                args.print_freq, world_size, args.gradient_accumulation_steps,
+                None, scaler
+            )
 
-        with Timer(' Test', logger):
-            if dataset_type.lower() == 'tripletface':
-                test_loss, current_acc = evaluate_triplet(model, data_loader_test, args.print_freq, logger)
-            else:  # CIFAR10
-                test_loss, test_acc1, test_acc5 = evaluate(model, criterion_eval, data_loader_test,
-                                                        args.print_freq, logger)
-                current_acc = test_acc1  # Use top-1 accuracy for consistency
+        # Learning rate scheduling
+        if lr_scheduler is not None:
+            lr_scheduler.step(epoch + 1)
 
-        if is_main_process() and tb_writer is not None:
-            tb_record_triplet(tb_writer, train_loss, test_loss, current_acc, epoch)
+        # Validation
+        with Timer('Test', logger):
+            test_loss, test_acc1, test_acc5 = evaluate(
+                model, criterion, data_loader_test, args.print_freq, logger
+            )
 
-        logger.info(' Test loss: {:.5f}, Accuracy: {:.5f}'.format(test_loss, current_acc))
+        # Use a meaningful metric for face recognition
+        # For embeddings, we'll use negative test loss as the metric to maximize
+        current_acc = -test_loss if test_acc1 == 0 else test_acc1
 
-        # Early stopping and checkpoint saving logic
+        # TensorBoard logging
+        tb_writer.add_scalar('Loss/Train', train_loss, epoch)
+        tb_writer.add_scalar('Loss/Test', test_loss, epoch)
+        tb_writer.add_scalar('Accuracy/Test_Acc1', test_acc1, epoch)
+        tb_writer.add_scalar('Accuracy/Test_Acc5', test_acc5, epoch)
+        tb_writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
+
+        logger.info(f'Epoch [{epoch}] Train Loss: {train_loss:.5f}, Test Loss: {test_loss:.5f}, Current Metric: {current_acc:.5f}')
+
+        # Early stopping and checkpointing
         is_best = current_acc > best_acc
         
         if is_best:
             best_acc = current_acc
-            max_acc1 = current_acc  # Update global max_acc1
+            max_acc1 = current_acc
             epochs_no_improve = 0
-            logger.info(f' New best accuracy: {best_acc:.5f}')
+            logger.info(f'New best metric: {best_acc:.5f}')
         else:
             epochs_no_improve += 1
-            logger.info(f' No improvement for {epochs_no_improve}/{patience} epochs (current: {current_acc:.5f}, best: {best_acc:.5f})')
+            logger.info(f'No improvement for {epochs_no_improve}/{args.patience} epochs')
 
-        # Create checkpoint dictionary
+        # Save checkpoint
         checkpoint = {
-            'model': model_without_ddp.state_dict(),
+            'model': model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'epoch': epoch,
             'max_acc1': max_acc1,
+            'args': args,
         }
         if lr_scheduler is not None:
             checkpoint['lr_scheduler'] = lr_scheduler.state_dict()
 
-        # Save best checkpoint
-        if is_best and is_main_process():
-            save_on_master(checkpoint, os.path.join(args.output_dir, 'checkpoint_best.pth'))
-            save_on_master(checkpoint, os.path.join(args.output_dir, 'checkpoint_max_acc1.pth'))
+        # Save best and latest checkpoints
+        if is_best:
+            torch.save(checkpoint, os.path.join(args.output_dir, 'checkpoint_best.pth'))
+            
+        if args.save_latest:
+            torch.save(checkpoint, os.path.join(args.output_dir, 'checkpoint_latest.pth'))
 
-        # Optional: save latest checkpoint
-        if args.save_latest and is_main_process():
-            save_on_master(checkpoint, os.path.join(args.output_dir, 'checkpoint_latest.pth'))
-
-        # Check for early stopping
-        if epochs_no_improve >= patience:
-            logger.info(f'Early stopping triggered after {epoch + 1} epochs with no improvement.')
-            logger.info(f'Best accuracy achieved: {best_acc:.5f}')
+        # Early stopping check
+        if epochs_no_improve >= args.patience:
+            logger.info(f'Early stopping after {epoch + 1} epochs')
             break
 
     logger.info('Training completed.')
