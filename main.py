@@ -823,12 +823,19 @@ def main():
     #                   Train
     ##################################################
 
+    # Early stopping variables - should be after resume logic
+    patience = 5  # Number of epochs to wait for improvement
+    best_acc = max_acc1  # Use the resumed max_acc1 or 0 if starting fresh
+    epochs_no_improve = 0
+
     tb_writer = None
     if is_main_process():
         tb_writer = SummaryWriter(os.path.join(args.output_dir, 'tensorboard'),
-                                  purge_step=start_epoch)
+                                purge_step=start_epoch)
 
     logger.info("[Train]")
+    logger.info(f"Starting training with best accuracy so far: {best_acc:.5f}")
+
     for epoch in range(start_epoch, args.epochs):
         if distributed and hasattr(data_loader_train.sampler, 'set_epoch'):
             data_loader_train.sampler.set_epoch(epoch)
@@ -837,14 +844,14 @@ def main():
         with Timer(' Train', logger):
             if dataset_type.lower() == 'tripletface':
                 train_loss = train_one_epoch(model, criterion, optimizer,
-                                                     data_loader_train, logger,
-                                                     args.print_freq, world_size,
-                                                     scheduler_per_iter, scaler)
+                                        data_loader_train, logger,
+                                        args.print_freq, world_size,
+                                        scheduler_per_iter, scaler)
             else:  # CIFAR10
                 train_loss = train_one_epoch(model, criterion, optimizer,
-                                             data_loader_train, logger,
-                                             args.print_freq, world_size,
-                                             scheduler_per_iter, scaler)
+                                        data_loader_train, logger,
+                                        args.print_freq, world_size,
+                                        scheduler_per_iter, scaler)
             if lr_scheduler is not None:
                 lr_scheduler.step(epoch + 1)
             if scheduler_per_epoch is not None:
@@ -852,17 +859,30 @@ def main():
 
         with Timer(' Test', logger):
             if dataset_type.lower() == 'tripletface':
-                test_loss, test_acc = test_triplet(model, data_loader_test, args.print_freq, logger)
+                test_loss, current_acc = evaluate_triplet(model, data_loader_test, args.print_freq, logger)
             else:  # CIFAR10
                 test_loss, test_acc1, test_acc5 = evaluate(model, criterion_eval, data_loader_test,
-                                                           args.print_freq, logger)
-                test_acc = test_acc1  # Use top-1 accuracy for consistency
+                                                        args.print_freq, logger)
+                current_acc = test_acc1  # Use top-1 accuracy for consistency
 
         if is_main_process() and tb_writer is not None:
-            tb_record_triplet(tb_writer, train_loss, test_loss, test_acc, epoch)
+            tb_record_triplet(tb_writer, train_loss, test_loss, current_acc, epoch)
 
-        logger.info(' Test loss: {:.5f}, Accuracy: {:.5f}'.format(test_loss, test_acc))
+        logger.info(' Test loss: {:.5f}, Accuracy: {:.5f}'.format(test_loss, current_acc))
 
+        # Early stopping and checkpoint saving logic
+        is_best = current_acc > best_acc
+        
+        if is_best:
+            best_acc = current_acc
+            max_acc1 = current_acc  # Update global max_acc1
+            epochs_no_improve = 0
+            logger.info(f' New best accuracy: {best_acc:.5f}')
+        else:
+            epochs_no_improve += 1
+            logger.info(f' No improvement for {epochs_no_improve}/{patience} epochs (current: {current_acc:.5f}, best: {best_acc:.5f})')
+
+        # Create checkpoint dictionary
         checkpoint = {
             'model': model_without_ddp.state_dict(),
             'optimizer': optimizer.state_dict(),
@@ -873,38 +893,22 @@ def main():
             checkpoint['lr_scheduler'] = lr_scheduler.state_dict()
 
         # Save best checkpoint
-        if test_acc > max_acc1:
-            max_acc1 = test_acc
-            best_ckpt = {
-                'model': model_without_ddp.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'epoch': epoch,
-                'max_acc1': max_acc1,
-            }
-            if lr_scheduler is not None:
-                best_ckpt['lr_scheduler'] = lr_scheduler.state_dict()
-            save_on_master(
-                best_ckpt,
-                os.path.join(args.output_dir, 'checkpoint_max_acc1.pth')
-            )
+        if is_best and is_main_process():
+            save_on_master(checkpoint, os.path.join(args.output_dir, 'checkpoint_best.pth'))
+            save_on_master(checkpoint, os.path.join(args.output_dir, 'checkpoint_max_acc1.pth'))
 
         # Optional: save latest checkpoint
-        if args.save_latest:
-            latest_ckpt = {
-                'model': model_without_ddp.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'epoch': epoch,
-                'max_acc1': max_acc1,
-            }
-            if lr_scheduler is not None:
-                latest_ckpt['lr_scheduler'] = lr_scheduler.state_dict()
-            save_on_master(
-                latest_ckpt,
-                os.path.join(args.output_dir, 'checkpoint_latest.pth')
-            )
+        if args.save_latest and is_main_process():
+            save_on_master(checkpoint, os.path.join(args.output_dir, 'checkpoint_latest.pth'))
+
+        # Check for early stopping
+        if epochs_no_improve >= patience:
+            logger.info(f'Early stopping triggered after {epoch + 1} epochs with no improvement.')
+            logger.info(f'Best accuracy achieved: {best_acc:.5f}')
+            break
 
     logger.info('Training completed.')
-
+    logger.info(f'Final best accuracy: {best_acc:.5f}')
     ##################################################
     #                   test
     ##################################################
