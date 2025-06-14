@@ -71,10 +71,6 @@ def parse_args():
     parser.add_argument('--optimizer', type=str, default='adamw')
     parser.add_argument('--weight-decay', default=0, type=float, help='weight decay')
 
-    parser.add_argument('--local-rank', type=int, default=0, help='Local rank for distributed training')
-
-    parser.add_argument('--local-rank', type=int, default=0, help='Local rank for distributed training')
-
     parser.add_argument('--print-freq', default=5, type=int,
                         help='Number of times a debug message is printed in one epoch')
     parser.add_argument('--data-path', default='./datasets', type=str,
