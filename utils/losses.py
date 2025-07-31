@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-import torch.nn.fuctional as F
+import torch.nn.functional as F
 import math
 
 class ArcFaceLoss(nn.Module):
