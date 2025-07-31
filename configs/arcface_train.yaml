@@ -1,0 +1,16 @@
+dataset: tripletface
+data_path: /kaggle/input/vggface2-subset-500/VGGFace2_subset_500
+triplet_list_val: /kaggle/input/mini-vggface2/triplets_train.txt
+output_dir: ./logs/triplet_face_aligned
+workers: 8
+batch_size: 128
+epochs: 11
+lr: 0.001
+input_size: [3, 112, 112]
+T: 4
+TET: true
+TET_phi: 1.5
+TET_lambda: 0.001
+arcface_s: 32.0
+arcface_m: 0.5
+amp: true
