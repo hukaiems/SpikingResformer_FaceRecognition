@@ -40,9 +40,9 @@ from timm.scheduler import create_scheduler_v2
 from timm.models import create_model
 from utils.triplet_face import TripletFaceDataset
 from utils.tripletloss import TripletLoss
+from utils.losses import ArcFaceLoss, TETArcFaceLoss
 
 import math
-
 
 def parse_args():
     config_parser = argparse.ArgumentParser(description="Training Config", add_help=False)
@@ -117,59 +117,6 @@ def parse_args():
 
     return args
 
-class ArcFaceLoss(nn.Module):
-    def __init__(self, embed_dim, num_classes, s=30.0, m=0.5):
-        super().__init__()
-        self.s = s  # Scale factor
-        self.m = m  # Margin
-        self.embed_dim = embed_dim
-        self.num_classes = num_classes
-        self.weight = nn.Parameter(torch.Tensor(num_classes, embed_dim))
-        nn.init.xavier_uniform_(self.weight)
-        self.cos_m = math.cos(m)
-        self.sin_m = math.sin(m)
-        self.threshold = math.cos(math.pi - m)
-        self.mm = self.sin_m * m
-
-    def forward(self, embeddings, labels):
-        # Handle different input shapes
-        if embeddings.dim() == 3:  # [T, B, embed_dim] - from TET
-            # Take mean across time steps
-            embeddings = embeddings.mean(0)  # [B, embed_dim]
-        elif embeddings.dim() == 2:  # [B, embed_dim] - normal case
-            pass
-        else:
-            raise ValueError(f"Unexpected embeddings shape: {embeddings.shape}")
-        
-        # # Debug prints
-        # print(f"ArcFace input embeddings shape: {embeddings.shape}")
-        # print(f"ArcFace labels shape: {labels.shape}")
-        # print(f"Weight shape: {self.weight.shape}")
-        
-        # Normalize embeddings and weights
-        embeddings_norm = F.normalize(embeddings, p=2, dim=1)  # [B, embed_dim]
-        weight_norm = F.normalize(self.weight, p=2, dim=1)     # [num_classes, embed_dim]
-        
-        # Compute cosine similarity
-        cos_theta = F.linear(embeddings_norm, weight_norm)  # [B, num_classes]
-        
-        # Compute sin_theta
-        sin_theta = torch.sqrt(1.0 - torch.pow(cos_theta, 2) + 1e-7)
-        
-        # Apply margin
-        cos_theta_m = cos_theta * self.cos_m - sin_theta * self.sin_m
-        
-        # Create mask for target classes
-        mask = torch.zeros_like(cos_theta).scatter_(1, labels.unsqueeze(1), 1.0)
-        
-        # Apply margin only to correct class
-        output = cos_theta * (1.0 - mask) + cos_theta_m * mask
-        output = output * self.s
-        
-        # Compute cross entropy loss
-        loss = F.cross_entropy(output, labels)
-        return loss
-
 
 def setup_logger(output_dir):
     logger = logging.getLogger(__name__)
@@ -210,38 +157,6 @@ def init_distributed(logger: logging.Logger, distributed_init_mode):
     return True, rank, world_size, local_rank
 
 
-class TETArcFaceLoss(nn.Module):
-    """TET-aware ArcFace loss that handles temporal outputs properly"""
-    def __init__(self, embed_dim, num_classes, s=30.0, m=0.5, TET_phi=1.0, TET_lambda=0.0):
-        super().__init__()
-        self.arcface = ArcFaceLoss(embed_dim, num_classes, s, m)
-        self.TET_phi = TET_phi
-        self.TET_lambda = TET_lambda
-        
-    def forward(self, embeddings, labels):
-        if embeddings.dim() == 3:  # [T, B, embed_dim]
-            T, B, D = embeddings.shape
-            total_loss = 0.0
-            
-            # Apply ArcFace loss at each time step
-            for t in range(T):
-                step_loss = self.arcface(embeddings[t], labels)  # [B, embed_dim]
-                total_loss += (1.0 - self.TET_lambda) * step_loss
-            
-            # Add TET regularization if needed
-            if self.TET_phi > 0:
-                # Mean squared error between consecutive time steps
-                mse_loss = 0.0
-                for t in range(1, T):
-                    mse_loss += F.mse_loss(embeddings[t], embeddings[t-1])
-                total_loss += self.TET_phi * self.TET_lambda * mse_loss / (T - 1)
-            
-            return total_loss / T
-        else:
-            # Standard case
-            return self.arcface(embeddings, labels)
-
-
 def load_data(
     dataset_dir: str,
     batch_size: int,
@@ -273,20 +188,6 @@ def load_data(
         )
         # Validation set remains triplet-based
         test_ds = TripletFaceDataset(triplet_list_val, transform=transform)
-    elif dataset_type.lower() == 'cifar10':
-        # CIFAR10 dataset
-        train_ds = torchvision.datasets.CIFAR10(
-            root=dataset_dir,
-            train=True,
-            download=True,
-            transform=transform
-        )
-        test_ds = torchvision.datasets.CIFAR10(
-            root=dataset_dir,
-            train=False,
-            download=True,
-            transform=transform
-        )
     else:
         raise ValueError(f"Unsupported dataset type: {dataset_type}")
 
@@ -330,6 +231,23 @@ def train_one_epoch(
     scheduler_per_iter: Optional[BaseSchedulerPerIter] = None,
     scaler: Optional[GradScaler] = None,
 ):
+    """
+    Train the model for one epoch
+
+    Args:
+        model (nn.Module): The neural network model.
+        criterion (nn.mMdule): Loss function
+        optimizer (Optimizer): optimizer.
+        data_loader_train (Dataloader): Training data loader.
+        logger (Logger): Logger for debug/info.
+        print_freq (int): How often to print debug info.
+        factor (int): World size for distributed training - (World size = total number of processes on GPU).
+        scheduler_per_iter (Optional): Per iteration scheduler
+        scaler (Optional): AMP scaler.
+    
+    Returns:
+        float: Average training loss for the epoch
+    """
     model.train()
     metric_dict = RecordDict({'loss': None})
     timer_container = [0.0]
@@ -379,102 +297,6 @@ def train_one_epoch(
     
     metric_dict.sync()
     return metric_dict['loss'].ave
-
-def train_one_epoch_triplet(
-    model, criterion, optimizer,
-    data_loader_train, logger,
-    print_freq, factor,
-    scheduler_per_iter=None, scaler=None,
-):
-    model.train()
-    metric_dict = RecordDict({'loss': None})
-    timer_container = [0.0]
-    model.zero_grad()
-
-    for idx, (anchor, positive, negative) in enumerate(data_loader_train):
-        with GlobalTimer('iter', timer_container):
-            # Move each tensor to GPU
-            anchor   = anchor.cuda()
-            positive = positive.cuda()
-            negative = negative.cuda()
-
-            # Concatenate into one big batch: [3*B, C, H, W]
-            images = torch.cat([anchor, positive, negative], dim=0)
-
-            # Forward + loss
-            if scaler is not None:
-                with autocast():
-                    embeddings = model(images)
-                    loss = criterion(embeddings)
-            else:
-                embeddings = model(images)
-                loss = criterion(embeddings)
-
-            metric_dict['loss'].update(loss.item())
-
-            # Backward + step
-            if scaler is not None:
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-                model.zero_grad()
-            else:
-                loss.backward()
-                optimizer.step()
-                model.zero_grad()
-
-            # Iter‐level scheduler
-            if scheduler_per_iter is not None:
-                scheduler_per_iter.step()
-
-            functional.reset_net(model)
-
-        # Logging
-        batch_size = anchor.size(0)
-        if print_freq and ((idx + 1) % int(len(data_loader_train) / print_freq) == 0):
-            metric_dict.sync()
-            logger.debug(
-                f' [{idx+1}/{len(data_loader_train)}] it/s: '
-                f'{(idx+1)*batch_size*factor/timer_container[0]:.5f}, '
-                f'loss: {metric_dict["loss"].ave:.5f}'
-            )
-
-    metric_dict.sync()
-    return metric_dict['loss'].ave
-
-
-def evaluate(model, criterion, data_loader, print_freq, logger, one_hot=None):
-    model.eval()
-    metric_dict = RecordDict({'loss': None, 'acc@1': None, 'acc@5': None})
-    with torch.no_grad():
-        for idx, (image, target) in enumerate(data_loader):
-            image, target = image.cuda(), target.cuda()
-            if one_hot:
-                target = F.one_hot(target, one_hot).float()
-            output = model(image)
-            loss = criterion(output, target)
-            metric_dict['loss'].update(loss.item())
-            functional.reset_net(model)
-
-            if target.dim() > 1:
-                target = target.argmax(-1)
-            acc1, acc5 = accuracy(output.mean(0), target, topk=(1, 5))
-            # FIXME need to take into account that the datasets
-            # could have been padded in distributed setup
-            batch_size = image.shape[0]
-            metric_dict['acc@1'].update(acc1.item(), batch_size)
-            metric_dict['acc@5'].update(acc5.item(), batch_size)
-
-            if print_freq != 0 and ((idx + 1) % int(len(data_loader) / print_freq)) == 0:
-                #torch.distributed.barrier()
-                metric_dict.sync()
-                logger.debug(' [{}/{}] loss: {:.5f}, acc@1: {:.5f}, acc@5: {:.5f}'.format(
-                    idx + 1, len(data_loader), metric_dict['loss'].ave, metric_dict['acc@1'].ave,
-                    metric_dict['acc@5'].ave))
-
-    #torch.distributed.barrier()
-    metric_dict.sync()
-    return metric_dict['loss'].ave, metric_dict['acc@1'].ave, metric_dict['acc@5'].ave
 
 def evaluate_triplet(model, data_loader, print_freq, logger):
     model.eval()
@@ -819,8 +641,6 @@ def main():
             return
         if dataset_type.lower() == 'tripletface':
             test_triplet(model_without_ddp, data_loader_test, args.print_freq, logger)
-        else:  # CIFAR10
-            test(model_without_ddp, data_loader_test, input_size, args, logger)
         return
 
     ##################################################
@@ -851,11 +671,6 @@ def main():
                                         data_loader_train, logger,
                                         args.print_freq, world_size,
                                         scheduler_per_iter, scaler)
-            else:  # CIFAR10
-                train_loss = train_one_epoch(model, criterion, optimizer,
-                                        data_loader_train, logger,
-                                        args.print_freq, world_size,
-                                        scheduler_per_iter, scaler)
             if lr_scheduler is not None:
                 lr_scheduler.step(epoch + 1)
             if scheduler_per_epoch is not None:
@@ -864,10 +679,6 @@ def main():
         with Timer(' Test', logger):
             if dataset_type.lower() == 'tripletface':
                 test_loss, current_acc = evaluate_triplet(model, data_loader_test, args.print_freq, logger)
-            else:  # CIFAR10
-                test_loss, test_acc1, test_acc5 = evaluate(model, criterion_eval, data_loader_test,
-                                                        args.print_freq, logger)
-                current_acc = test_acc1  # Use top-1 accuracy for consistency
 
         if is_main_process() and tb_writer is not None:
             tb_record_triplet(tb_writer, train_loss, test_loss, current_acc, epoch)
