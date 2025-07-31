@@ -1,0 +1,11 @@
+torch
+torchvision
+tensorboard
+thop
+spikingjelly==0.0.0.0.14
+cupy-cuda11x
+timm
+scikit-learn
+numpy
+Pillow
+pyyaml
