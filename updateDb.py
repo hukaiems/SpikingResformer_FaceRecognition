@@ -1,6 +1,6 @@
 import os
 import torch
-from inference import preprocess_image, load_config, save_to_database
+from SpikingResformer_Siamese.backend import preprocess_image, load_config, save_to_database
 from timm.models import create_model
 import numpy as np
 
@@ -20,12 +20,15 @@ def batch_add_images_to_db(folder_path, db_embeddings_path="db_embeddings.npy", 
     image_files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
     for img_file in image_files:
         img_path = os.path.join(folder_path, img_file)
-        img_tensor = preprocess_image(img_path, input_size).cuda()
-        with torch.no_grad():
-            embedding = model(img_tensor)
-            if embedding.dim() == 3:
-                embedding = embedding.mean(0)
-            embedding = embedding.squeeze(0).cpu().numpy()
-        label = os.path.splitext(img_file)[0]  # Use filename (without extension) as label
-        save_to_database(embedding, label, db_embeddings_path, db_labels_path)
-        print(f"Added {img_file} as '{label}' to database.")
+        try:
+            img_tensor = preprocess_image(img_path, input_size).cuda()
+            with torch.no_grad():
+                embedding = model(img_tensor)
+                if embedding.dim() == 3:
+                    embedding = embedding.mean(0)
+                embedding = embedding.squeeze(0).cpu().numpy()
+            label = os.path.splitext(img_file)[0]  # Use filename (without extension) as label
+            save_to_database(embedding, label, db_embeddings_path, db_labels_path)
+            print(f"Added {img_file} as '{label}' to database")
+        except Exception as e:
+            print(f"Failed to process {img_file}: {e}")

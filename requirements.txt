@@ -8,3 +8,14 @@ timm>=0.6.0
 thop>=0.1.1
 tensorboard>=2.8.0
 cupy-cuda12x>=12.0.0
+fastapi
+uvicorn[standard]
+torch
+torchvision
+timm
+mtcnn
+pyyaml
+pillow
+numpy
+tensorflow
+python-multipart>=0.0.6

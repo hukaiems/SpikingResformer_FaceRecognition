@@ -1,0 +1,5 @@
+model: spikingresformer_ti
+checkpoint: ./logs/checkpoint_best.pth
+input_size: [3, 112, 112]
+T: 4
+embed_dim: 512
