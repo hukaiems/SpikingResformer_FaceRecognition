@@ -19,3 +19,4 @@ pillow
 numpy
 tensorflow
 python-multipart>=0.0.6
+facenet-pytorch

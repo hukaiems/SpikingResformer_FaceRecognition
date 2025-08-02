@@ -1,11 +1,10 @@
 import torch
-from torchvision import transforms
 import yaml
 from PIL import Image
 import argparse
 from timm.models import create_model
 import numpy as np
-from mtcnn import MTCNN
+from facenet_pytorch import MTCNN
 import io
 from typing import List, Tuple, Optional
 import uvicorn
@@ -22,7 +21,7 @@ def load_config(config_path):
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
     
-def load_model(cfg_path: str, device: torch.device = torch.device('cpu')) -> Tuple[torch.nn.Module, transforms.Compose]:
+def load_model(cfg_path: str, device: torch.device = torch.device('cpu')) -> torch.nn.Module:
     "Load the SNNs face recognition model and preprocessing pipeline"
     cfg = load_config(cfg_path)
     input_size = cfg.get('input_size', [3, 112, 112])
@@ -42,33 +41,22 @@ def load_model(cfg_path: str, device: torch.device = torch.device('cpu')) -> Tup
     model.load_state_dict(checkpoint['model'])
     model.to(device).eval()
 
-    # preprocessing 
-    preprocess = transforms.Compose([
-        transforms.Resize(input_size[-2:]), #take the last two elements
-        transforms.CenterCrop(input_size[-2:]),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-    return model, preprocess
+    return model
 
 def get_embedding(
         model: torch.nn.Module,
-        preprocess: transforms.Compose,
         img_bytes: bytes,
-        detector: MTCNN,
         device: torch.device,
 ) -> np.array:
+    
     "Detect face, preprocess, and compute the embedding"
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     # Detect faces
-    dets = detector.detect_faces(np.array(img))
-    if not dets:
+    aligned = detector(img)
+    if aligned is None:
         raise ValueError("No face detected")
-    x, y, w, h = dets[0]["box"]
-    face = img.crop((x, y, x + w, y + h))
-
-    # Preprocess
-    tensor = preprocess(face).unsqueeze(0).to(device)
+    
+    tensor = aligned.unsqueeze(0).to(device)
     # Infer
     with torch.no_grad():
         emb = model(tensor)
@@ -133,11 +121,16 @@ app.add_middleware(
 # Globals
 model = None
 preprocess_fn = None
-detector = None
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+detector = MTCNN(
+    image_size = 112, 
+    margin=0, 
+    post_process=False, 
+    device=device
+)
 db_embeddings = np.zeros((0, 512), dtype=np.float32)
 db_labels: List[str]= []
-THRESHOLD = 0.7
+THRESHOLD = 0.75
 DB_PATH = "faces.db"
 conn: sqlite3.Connection = None
 cursor: sqlite3.Cursor = None
@@ -147,7 +140,8 @@ cursor: sqlite3.Cursor = None
 default_response = {
     "recognized": False,
     "user_id": None,
-    "similarity": 0.0
+    "similarity": 0.0,
+    "votes": 0
 }
 
 # provide json data will be given back
@@ -155,18 +149,24 @@ class RecognizeResponse(BaseModel):
     recognized: bool
     user_id: Optional[str]
     similarity: float
+    votes: int
 
 @app.on_event("startup")
 def startup_event(): # are the positions matter ?
     global model, preprocess_fn, detector, conn, cursor, db_embeddings, db_labels
 
     # 1 load model, preprocess and face detector
-    model, preprocess_fn = load_model("configs/inference.yaml", device)
-    detector = MTCNN()
+    model = load_model("configs/inference.yaml", device)
+
+    # warm up spiking
+    from PIL import Image
+    dummy_img = Image.new("RGB", (112, 112), (128, 128, 128)) # last one create shade of grey
+    _ = detector(dummy_img)
 
     # 2 open sqlite and create table
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    cursor = conn.cursor()
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False) #Fastapi might handles requests across threads
+    # because requests can come at the same time, in that moment they need to access db so we let check_same_thread False
+    cursor = conn.cursor() # use this to execute command in SQL
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS faces (
             user_id TEXT PRIMARY KEY,
@@ -176,15 +176,16 @@ def startup_event(): # are the positions matter ?
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
 """)
-    conn.commit()
+    conn.commit() # like GIT, to save everything in db
 
     # 3 Load existing faces into memory
     cursor.execute("SELECT user_id, frontal_emb, left_emb, right_emb FROM faces")
-    rows = cursor.fetchall()
+    rows = cursor.fetchall() #taje all data put into rows var
     db_labels = [row[0] for row in rows]
     # convert each BLOB back into numpy array
     db_embeddings = np.vstack([
-        np.frombuffer(row[1], dtype=np.float32)
+        np.frombuffer(emb, dtype=np.float32) # turn bytes back to numpy 
+        # loop through all the user in rows and get all the embedding
         for row in rows
         for emb in row[1:4]
     ]) if rows else np.zeros((0, 512), dtype=np.float32)
@@ -192,7 +193,7 @@ def startup_event(): # are the positions matter ?
 # register a new face
 @app.post("/register")
 async def register_face(
-    user_id: str =Form(...),
+    user_id: str =Form(...), # (...) stands for required
     frontal: UploadFile = File(...),
     left: UploadFile = File(...),
     right: UploadFile = File(...),
@@ -209,7 +210,7 @@ async def register_face(
             img_bytes = await file.read()
 
             # Get embedding
-            emb = get_embedding(model, preprocess_fn, img_bytes, detector, device)
+            emb = get_embedding(model, img_bytes, device)
             embeddings[pose] = emb.astype(np.float32).tobytes()
 
         #insert into DB
@@ -241,27 +242,52 @@ async def register_face(
                 "registered_poses": list(files.keys())
             }
         )
+    # any exception will run this code block
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
     
 @app.post("/compare", response_model=RecognizeResponse)
 async def compare_face(
-    image: UploadFile = File(...)
+    images: List[UploadFile] = File(..., description="Send 5 face images")
 ):
-    try:
+    if len(images) < 5:
+        raise HTTPException(400, "Please send exactly 5 images")
+    
+
+    #  1 run each image throguh get embed + comparison
+    votes = {} #user_id -> count of passes
+    sims = [] #collect (user_id, sim) tuples for reporting
+
+    for image in images:
         img_bytes = await image.read()
-        emb = get_embedding(model, preprocess_fn, img_bytes, detector, device)
-
+        try:
+            emb = get_embedding(model, img_bytes, device)
+        except ValueError: 
+            # no face in this one- count as a miss
+            continue
         user_id, similarity = compare_embedding(emb, db_embeddings, db_labels, THRESHOLD)
-        recognized = user_id is not None
+        sims.append((user_id, similarity))
+        if user_id is not None:
+            votes[user_id] = votes.get(user_id, 0) + 1 # 0 are default params
+        
+    # 2 decide winner
+    best_user, best_votes = None, 0
+    for user_id, count in votes.items():
+        if count > best_votes:
+            best_user, best_votes = user_id, count
 
-        return RecognizeResponse(
-            recognized=recognized,
-            user_id=user_id,
-            similarity=similarity
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Comparison faield: {str(e)}")
+    # 3 If someone got 3 mores => recognized
+    recognized = (best_votes >=3 )
+    best_sim = 0.0
+    if recognized:
+        best_sim = max(sim for (uid, sim) in sims if uid == best_user)
+
+    return RecognizeResponse(
+        recognized=recognized,
+        user_id=best_user if recognized else None,
+        similarity=best_sim,
+        votes = best_votes
+    )
 
 @app.get("/healthz")
 def healthz():
